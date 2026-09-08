@@ -70,16 +70,17 @@ mkwin() { # addr class title ws pid stableId at size floating pinned fullscreen
   mkwin 0x9 Alacritty tmux 6 31000 s9 '[12,38]' '[1256,750]' false false 0
   mkwin 0xa foot zsh 6 32000 s10 '[12,38]' '[1256,750]' false false 2
   mkwin 0xb Aether Aether 2 44721 s11 '[12,38]' '[621,750]' false false 0
-  mkwin 0xc org.gnome.Nautilus logos special:scratchpad 194829 s12 '[12,38]' '[621,750]' false false 0
+  mkwin 0xc org.gnome.Nautilus logos 7 194829 s12 '[12,38]' '[621,750]' false false 0
   mkwin 0xd org.omarchy.menu menu 3 99 s13 '[0,0]' '[1,1]' true false 0
   mkwin 0xe foot parked special:ls-other 32000 s14 '[0,0]' '[1,1]' false false 0
+  mkwin 0xf com.scratch.App scratch special:scratchpad 40000 s15 '[0,0]' '[1,1]' false false 0
 } | jq -s . >"$T/fake/clients.json"
 
 echo "== save: launch derivation"
 "$L" save main >/dev/null || tfail "save exited non-zero"
 J="$T/config/layouts/main.json"
 [[ -f $J ]] || tfail "layout file missing"
-n=$(jq '.windows|length' "$J"); [[ $n == 12 ]] || tfail "expected 12 windows (menu + parked ignored), got $n"
+n=$(jq '.windows|length' "$J"); [[ $n == 11 ]] || tfail "expected 11 windows (menu, parked, agent, scratchpad excluded), got $n"
 kind() { jq -r --arg c "$1" '.windows[]|select(.class==$c)|.launch.kind' "$J" | head -1; }
 cmd() { jq -r --arg c "$1" '.windows[]|select(.class==$c)|.launch.cmd' "$J" | head -1; }
 [[ $(kind chrome-x.com__-Profile_1) == webapp ]] || tfail "webapp kind"
@@ -89,8 +90,6 @@ cmd() { jq -r --arg c "$1" '.windows[]|select(.class==$c)|.launch.cmd' "$J" | he
 [[ $(kind chrome-pacgdjiidkfdhilcljkeebfoklekebig-Profile_2) == pwa ]] || tfail "pwa kind"
 [[ $(cmd chrome-pacgdjiidkfdhilcljkeebfoklekebig-Profile_2) == "chromium --profile-directory='Profile 2' --app-id=pacgdjiidkfdhilcljkeebfoklekebig" ]] || tfail "pwa cmd: $(cmd chrome-pacgdjiidkfdhilcljkeebfoklekebig-Profile_2)"
 [[ $(kind chromium) == chromium && $(cmd chromium) == "chromium --new-window" ]] || tfail "chromium: $(cmd chromium)"
-[[ $(kind org.omarchy.agent) == agent ]] || tfail "agent kind"
-[[ $(cmd org.omarchy.agent) == "xdg-terminal-exec --app-id=org.omarchy.agent --dir=/home/u/Work -e /home/u/.local/share/mise/installs/claude/latest/claude --permission-mode auto" ]] || tfail "agent cmd: $(cmd org.omarchy.agent)"
 [[ $(cmd foot) == "xdg-terminal-exec --app-id=foot --dir=/home/u/Work/tries -e bash -c 'nvim notes.md; exec bash'" ]] || tfail "foreground job: $(cmd foot)"
 [[ $(kind Alacritty) == tmux && $(cmd Alacritty) == "xdg-terminal-exec --app-id=Alacritty --dir=/home/u -e bash -c 'tmux attach || tmux new -s Work'" ]] || tfail "tmux: $(cmd Alacritty)"
 idle=$(jq -r '.windows[]|select(.class=="foot" and .title=="zsh")|.launch.cmd' "$J")
@@ -98,17 +97,30 @@ idle=$(jq -r '.windows[]|select(.class=="foot" and .title=="zsh")|.launch.cmd' "
 [[ $(kind Aether) == native && $(cmd Aether) == "/usr/bin/aether" ]] || tfail "native: $(cmd Aether)"
 [[ $(jq -r '.windows[]|select(.class=="Aether")|.launch.cwd' "$J") == /home/u ]] || tfail "native cwd"
 [[ $(cmd org.gnome.Nautilus) == "/usr/bin/nautilus --new-window" ]] || tfail "nautilus"
-[[ $(jq -r '.windows[]|select(.class=="org.gnome.Nautilus")|.workspace' "$J") == special:scratchpad ]] || tfail "scratchpad kept"
+[[ $(jq '[.windows[]|select(.class=="org.omarchy.agent")]|length' "$J") == 0 ]] || tfail "agent window should be excluded from layouts"
+[[ $(jq '[.windows[]|select(.workspace|startswith("special:"))]|length' "$J") == 0 ]] || tfail "special-workspace windows (scratchpad) should be excluded"
 [[ $(jq -r '.windows[]|select(.title=="nvim notes.md")|[.floating,.pinned,.size[0]]|@csv' "$J") == "true,true,800" ]] || tfail "float/pin/size"
 [[ $(jq -r '.windows[]|select(.title=="zsh")|.fullscreen' "$J") == 2 ]] || tfail "fullscreen int"
 [[ $(jq -r '.active_workspace' "$J") == 3 && $(jq -r '.monitors[0]' "$J") == eDP-1 ]] || tfail "meta"
 [[ $(cat "$T/state/active") == main ]] || tfail "active set"
-pass "12 records, every launch kind derived as expected"
+pass "11 records; agent and special-workspace windows excluded"
+
+echo "== agent-window derivation still works when the class is not ignored"
+(
+  export LAYOUT_SWAPPER_CONFIG_DIR="$T/cfg-agent" LAYOUT_SWAPPER_STATE_DIR="$T/st-agent"
+  "$L" config ignore_classes org.omarchy.menu >/dev/null
+  "$L" save ag >/dev/null
+  JA="$T/cfg-agent/layouts/ag.json"
+  [[ $(jq -r '.windows[]|select(.class=="org.omarchy.agent")|.launch.kind' "$JA") == agent ]] || tfail "agent kind"
+  [[ $(jq -r '.windows[]|select(.class=="org.omarchy.agent")|.launch.cmd' "$JA") == "xdg-terminal-exec --app-id=org.omarchy.agent --dir=/home/u/Work -e /home/u/.local/share/mise/installs/claude/latest/claude --permission-mode auto" ]] || tfail "agent cmd"
+  [[ $(jq '[.windows[]|select(.workspace|startswith("special:"))]|length' "$JA") == 0 ]] || tfail "special still excluded (hardcoded)"
+)
+pass "agent derivation intact; special always excluded"
 
 echo "== save: empty snapshot refused, --force allowed"
 cp "$T/fake/clients.json" "$T/clients.full.json"; echo '[]' >"$T/fake/clients.json"
 if "$L" save main 2>/dev/null; then tfail "empty save should fail"; fi
-[[ $(jq '.windows|length' "$J") == 12 ]] || tfail "layout clobbered"
+[[ $(jq '.windows|length' "$J") == 11 ]] || tfail "layout clobbered"
 "$L" save main --force >/dev/null; [[ $(jq '.windows|length' "$J") == 0 ]] || tfail "--force"
 cp "$T/clients.full.json" "$T/fake/clients.json"; "$L" save main >/dev/null
 pass "refusal and --force"
@@ -134,8 +146,8 @@ if "$L" delete main 2>/dev/null; then tfail "deleting active should fail"; fi
 pass "management commands"
 
 echo "== restore: claim existing, launch missing, place, chromium bootstrap"
-# Live desktop: X webapp (same stableId, moved to ws 9 by the user), agent
-# (class match, new stableId); everything else gone. Browser not running.
+# Live desktop: X webapp (same stableId, moved to ws 9 by the user); an agent
+# window (must be left untouched); a stray kitty. Browser not running.
 {
   mkwin 0x1 chrome-x.com__-Profile_1 "Home / X" 9 15035 s1 '[12,38]' '[1256,750]' false false 0
   mkwin 0x77 org.omarchy.agent "other title" 7 19285 zz '[12,38]' '[1256,750]' false false 0
@@ -147,7 +159,7 @@ D="$T/fake/dispatch.log"
 grep -q 'hl.dsp.exec_cmd(\[\[chromium --profile-directory=.Profile 1.\]\])' "$D" || tfail "browser bootstrap for Profile 1 missing"
 grep -q 'exec_cmd(\[\[chromium --profile-directory=Default\]\])' "$D" || tfail "browser bootstrap for Default missing"
 grep -q 'window.move({ window = "address:0x1", workspace = "1", follow = false })' "$D" || tfail "claimed X window moved back to ws 1"
-grep -q 'window.move({ window = "address:0x77", workspace = "3", follow = false })' "$D" || tfail "agent claimed by class and moved"
+grep -q 'address:0x77' "$D" && tfail "agent window must be left untouched by restore"
 grep -q 'exec_cmd(\[\[uwsm-app -- xdg-terminal-exec --app-id=Alacritty' "$D" || tfail "tmux terminal launched"
 grep -q 'exec_cmd(\[\[uwsm-app -- cd /home/u && /usr/bin/aether\]\], { workspace = "2 silent" })' "$D" || tfail "native launched with cwd: $(grep aether "$D" || true)"
 grep -q 'exec_cmd(\[\[uwsm-app -- xdg-terminal-exec --app-id=foot --dir=/home/u/Work/tries -e bash -c .nvim notes.md; exec bash.\]\], { workspace = "3 silent", float = true, size = {800, 500}, move = {100, 100} })' "$D" || tfail "float exec rules"

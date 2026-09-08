@@ -101,8 +101,13 @@ DEFAULT_CONFIG = {
     # Opt-in: notify a few minutes after login when a newer version is on the
     # plugin's git remote. Off until the user turns it on.
     "update_check": "off",
-    # Transient / shell windows never worth restoring.
+    # Transient / shell windows never worth restoring. org.omarchy.agent is
+    # here because agent terminals (Omarchy agents, the Agent Launcher's Hermes
+    # sessions) are summoned on demand from the agent menu and keep running in
+    # tmux when their window is closed — layouts should never save, relaunch,
+    # or surface them. Remove it from this list if you want agents in layouts.
     "ignore_classes": [
+        "org.omarchy.agent",
         "org.omarchy.menu",
         "org.omarchy.osd",
         "org.omarchy.shell",
@@ -600,7 +605,11 @@ def is_ignored(client, cfg):
     if cls in cfg["ignore_classes"]:
         return True
     ws = (client.get("workspace") or {}).get("name") or ""
-    if ws.startswith(PARK_PREFIX):
+    # Leave every special workspace alone: the scratchpad and any user special
+    # workspace are global and toggled by the user (moving a window onto the
+    # scratchpad toggles it), and ls-* is our own parking area. Managing them
+    # from a layout yanks scratchpad windows out and flickers the overlay.
+    if ws.startswith("special:"):
         return True
     if not client.get("mapped", True) or client.get("hidden", False):
         return True
@@ -875,7 +884,13 @@ def reconcile(layout, mode="keep", park_as=None, hypr=None, cfg=None):
     """Bring `layout` up. mode: keep | close | park (extras go to special:ls-<park_as>)."""
     cfg = cfg or load_config()
     hypr = hypr or Hypr()
-    records = layout.get("windows") or []
+    # Never act on a member saved on a special workspace or one whose class is
+    # now ignored (older layout files may still carry a scratchpad or agent
+    # entry). Placing a scratchpad member toggles the overlay; relaunching an
+    # agent surfaces a window the user summons on demand. Leave both be.
+    records = [r for r in (layout.get("windows") or [])
+               if not str((r.get("workspace") or "")).startswith("special:")
+               and (r.get("class") or "") not in cfg["ignore_classes"]]
     summary = {"claimed": 0, "launched": 0, "missing": [], "extras": 0}
     with Lock():
         clients = hypr.clients()
