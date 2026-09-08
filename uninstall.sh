@@ -13,6 +13,13 @@ if [[ -f $STATE/watch.pid ]]; then
   kill "$(cat "$STATE/watch.pid")" 2>/dev/null && echo "  stopped autosave daemon" || true
 fi
 
+# Turn off the opt-in update-check timer and remove its unit files.
+if [[ -x "$HOME/.local/bin/omarchy-layout-swapper" ]]; then
+  "$HOME/.local/bin/omarchy-layout-swapper" update-notify off >/dev/null 2>&1 || true
+elif [[ -x $BIN ]]; then
+  "$BIN" update-notify off >/dev/null 2>&1 || true
+fi
+
 L="$HOME/.local/bin/omarchy-layout-swapper"
 [[ -L $L ]] && rm -f "$L" && echo "  removed $L"
 

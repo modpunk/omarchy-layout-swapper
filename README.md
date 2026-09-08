@@ -107,11 +107,29 @@ omarchy plugin update                               # every git-managed plugin
 ```
 
 That fetches the latest commit, shows you the diff, fast-forwards your copy,
-re-validates the manifest, and reloads the shell. **Updates are not automatic
-and nothing notifies you when a new version lands** — Omarchy's "update
-available" bar indicator tracks the system, not plugins. Run the command above
-now and then, or watch the repo on GitHub. After updating, restart the shell
-once (`omarchy restart shell`) if the bar chip does not refresh on its own.
+re-validates the manifest, and reloads the shell. Omarchy's "update available"
+bar indicator tracks the system, not plugins, so it will not tell you a new
+version of this plugin exists. After updating, restart the shell once
+(`omarchy restart shell`) if the bar chip does not refresh on its own.
+
+### Update notifications (opt-in)
+
+If you want to be told when a new version is out, turn on update notifications:
+
+```bash
+omarchy-layout-swapper update-notify on     # or the menu: Layouts → Notify me about updates
+```
+
+This is **off by default**. When on, a `systemd --user` timer checks the
+plugin's git remote a few minutes **after** you log in — in the background, so
+it never sits on the boot path — and at most once a day after that. If a newer
+version exists, you get one desktop notification listing what changed (the
+commit messages between your version and the latest) and the
+`omarchy plugin update` command to apply it. It notifies once per new version,
+never auto-updates, and stays quiet when you are offline. Turn it off again
+with `omarchy-layout-swapper update-notify off` (or the same menu toggle),
+which also removes the timer. So keep your commit messages descriptive — they
+are the changelog your users see.
 
 ## How it works
 

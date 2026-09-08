@@ -244,4 +244,36 @@ echo '{"select":"main\t12 windows"}' >"$T/fake/menu.json"
 "$L" menu delete >/dev/null; [[ ! -f $T/config/layouts/main.json ]] || tfail "menu delete"
 pass "menu save/delete"
 
+echo "== update notifications: opt-in gate, changelog, dedup"
+export LAYOUT_SWAPPER_NO_SYSTEMD=1
+GA=(-c user.email=t@t -c user.name=t -c init.defaultBranch=main -c commit.gpgsign=false)
+UP="$T/upstream"
+git "${GA[@]}" init -q -b main "$UP"
+( cd "$UP" && echo v1 >README.md && git "${GA[@]}" add -A && git "${GA[@]}" commit -q -m "initial release" )
+PLUG="$T/plugin"
+git "${GA[@]}" clone -q "$UP" "$PLUG" 2>/dev/null
+export LAYOUT_SWAPPER_PLUGIN_DIR="$PLUG"
+( cd "$UP" && echo x >>README.md && git "${GA[@]}" commit -qam "fix: stop parking the wrong window on switch" \
+  && echo y >>README.md && git "${GA[@]}" commit -qam "feat: restore tmux terminals by re-attaching" )
+
+[[ $("$L" update-check --print) == "" ]] || tfail "update-check ran while opted out"
+[[ $("$L" update-notify status) == off ]] || tfail "default update_check not off"
+
+"$L" update-notify on >/dev/null
+[[ $("$L" update-notify status) == on ]] || tfail "opt-in did not set on"
+out=$("$L" update-check --print)
+grep -q "update available (2 changes)" <<<"$out" || tfail "count/title: $out"
+grep -q "feat: restore tmux terminals" <<<"$out" || tfail "feature subject missing"
+grep -q "fix: stop parking the wrong window" <<<"$out" || tfail "fix subject missing"
+grep -q "omarchy plugin update" <<<"$out" || tfail "update command missing"
+
+[[ $("$L" update-check --print) == "" ]] || tfail "re-notified the same version"
+grep -q "update available" <<<"$("$L" update-check --print --force)" || tfail "--force did not re-report"
+
+"$L" update-notify off >/dev/null
+[[ $("$L" update-notify status) == off ]] || tfail "opt-out did not set off"
+[[ $("$L" update-check --print) == "" ]] || tfail "check ran after opt-out"
+unset LAYOUT_SWAPPER_PLUGIN_DIR LAYOUT_SWAPPER_NO_SYSTEMD
+pass "update notifications"
+
 echo "All tests passed."

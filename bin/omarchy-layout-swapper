@@ -28,6 +28,7 @@ import os
 import re
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -54,6 +55,18 @@ ACTIVE_FILE = os.path.join(STATE_DIR, "active")
 PID_FILE = os.path.join(STATE_DIR, "watch.pid")
 LOCK_FILE = os.path.join(STATE_DIR, "restore.lock")
 LOG_FILE = os.path.join(STATE_DIR, "watch.log")
+UPDATE_NOTIFIED_FILE = os.path.join(STATE_DIR, "update-last-notified")
+# Where `omarchy plugin add` cloned this plugin (a git checkout with an origin).
+PLUGIN_DIR = os.environ.get(
+    "LAYOUT_SWAPPER_PLUGIN_DIR",
+    os.path.join(HOME, ".config", "omarchy", "plugins", "fans.omarchy.layout-swapper"),
+)
+SYSTEMD_USER_DIR = os.environ.get(
+    "LAYOUT_SWAPPER_SYSTEMD_DIR",
+    os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "systemd", "user"),
+)
+UPDATE_SERVICE = "omarchy-layout-swapper-update.service"
+UPDATE_TIMER = "omarchy-layout-swapper-update.timer"
 PROC = os.environ.get("LAYOUT_SWAPPER_PROC", "/proc")
 # Test hook: a directory with clients.json / monitors.json / activeworkspace.json
 # and a dispatch.log that records what would have been dispatched.
@@ -85,6 +98,9 @@ DEFAULT_CONFIG = {
     "launch_timeout": 12,
     "backups": 5,
     "default_layout": "main",
+    # Opt-in: notify a few minutes after login when a newer version is on the
+    # plugin's git remote. Off until the user turns it on.
+    "update_check": "off",
     # Transient / shell windows never worth restoring.
     "ignore_classes": [
         "org.omarchy.menu",
@@ -945,6 +961,166 @@ def describe(summary, name):
 
 
 # --------------------------------------------------------------------------
+# update notifications (opt-in)
+
+def git(directory, *args, timeout=25):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0",
+               GIT_SSH_COMMAND=os.environ.get("GIT_SSH_COMMAND", "ssh -oBatchMode=yes"))
+    return subprocess.run(["git", "-C", directory, *args], capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def cli_path():
+    link = os.path.join(HOME, ".local", "bin", "omarchy-layout-swapper")
+    if os.path.exists(link):
+        return link
+    return os.path.join(PLUGIN_DIR, "bin", "omarchy-layout-swapper")
+
+
+def systemd_available():
+    return not os.environ.get("LAYOUT_SWAPPER_NO_SYSTEMD") and shutil.which("systemctl") is not None
+
+
+def systemctl(*args):
+    try:
+        subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def write_update_units():
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    cli = cli_path()
+    with open(os.path.join(SYSTEMD_USER_DIR, UPDATE_SERVICE), "w", encoding="utf-8") as f:
+        f.write(
+            "[Unit]\n"
+            "Description=Check for Layout Swapper (omarchy) updates\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"ExecStart={cli} update-check\n"
+        )
+    with open(os.path.join(SYSTEMD_USER_DIR, UPDATE_TIMER), "w", encoding="utf-8") as f:
+        # OnStartupSec is measured from the user manager starting (i.e. login),
+        # so the check runs a few minutes AFTER login, in the background, and
+        # never sits on the boot path. OnUnitActiveSec re-checks daily in long
+        # sessions; Persistent catches a missed run.
+        f.write(
+            "[Unit]\n"
+            "Description=Check for Layout Swapper (omarchy) updates after login\n\n"
+            "[Timer]\n"
+            "OnStartupSec=5min\n"
+            "OnUnitActiveSec=1d\n"
+            "Persistent=true\n\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n"
+        )
+
+
+def remove_update_units():
+    for u in (UPDATE_TIMER, UPDATE_SERVICE):
+        try:
+            os.unlink(os.path.join(SYSTEMD_USER_DIR, u))
+        except OSError:
+            pass
+
+
+def cmd_update_notify(args):
+    """Turn the opt-in login update check on or off (config + systemd --user timer)."""
+    cfg = load_config()
+    what = args[0] if args else "status"
+    if what == "toggle":
+        what = "off" if cfg.get("update_check") == "on" else "on"
+    if what == "on":
+        cfg["update_check"] = "on"
+        save_config(cfg)
+        if systemd_available():
+            write_update_units()
+            systemctl("daemon-reload")
+            systemctl("enable", "--now", UPDATE_TIMER)
+        notify("Update notifications on",
+               "Layout Swapper will check a few minutes after login and tell you what changed.")
+        print("update notifications: on")
+    elif what == "off":
+        if systemd_available():
+            systemctl("disable", "--now", UPDATE_TIMER)
+        remove_update_units()
+        if systemd_available():
+            systemctl("daemon-reload")
+        cfg["update_check"] = "off"
+        save_config(cfg)
+        notify("Update notifications off")
+        print("update notifications: off")
+    elif what == "status":
+        print(cfg.get("update_check", "off"))
+    else:
+        raise SystemExit("usage: omarchy-layout-swapper update-notify on|off|toggle|status")
+    return 0
+
+
+def cmd_update_check(args):
+    """Compare the installed checkout against its git remote; on a new version,
+    send one desktop notification listing what changed. Run by the login timer;
+    --force ignores the opt-in and the once-per-version guard, --print writes
+    the notification to stdout instead of sending it."""
+    force = "--force" in args
+    printout = "--print" in args
+    cfg = load_config()
+    if cfg.get("update_check") != "on" and not force:
+        return 0
+    d = PLUGIN_DIR
+    if not os.path.isdir(os.path.join(d, ".git")):
+        return 0  # not a git checkout (e.g. installed by hand): nothing to compare
+    try:
+        if git(d, "fetch", "--quiet", "origin", "HEAD").returncode != 0:
+            return 0  # offline or fetch refused: stay silent, try again next time
+        head = git(d, "rev-parse", "HEAD").stdout.strip()
+        target = git(d, "rev-parse", "FETCH_HEAD").stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if not target or head == target:
+        return 0
+    try:
+        n = int(git(d, "rev-list", "--count", "HEAD..FETCH_HEAD").stdout.strip() or "0")
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return 0  # remote diverged but is not ahead; leave it to `omarchy plugin update`
+
+    last = ""
+    try:
+        with open(UPDATE_NOTIFIED_FILE, encoding="utf-8") as f:
+            last = f.read().strip()
+    except OSError:
+        pass
+    if last == target and not force:
+        return 0  # already told the user about this version
+
+    subjects = [s for s in git(d, "log", "--no-merges", "--pretty=format:%s", "HEAD..FETCH_HEAD").stdout.splitlines() if s.strip()]
+    shown = subjects[:12]
+    title = f"Layout Swapper: update available ({n} change{'s' if n != 1 else ''})"
+    body = "\n".join("• " + s for s in shown)
+    if len(subjects) > len(shown):
+        body += f"\n…and {len(subjects) - len(shown)} more"
+    body += "\n\nUpdate:  omarchy plugin update"
+
+    if printout:
+        print(title)
+        print(body)
+    else:
+        try:
+            subprocess.run(["notify-send", "-a", "Layout Swapper", "-u", "normal", title, body], check=False, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        ensure_dirs()
+        with open(UPDATE_NOTIFIED_FILE + ".tmp", "w", encoding="utf-8") as f:
+            f.write(target + "\n")
+        os.replace(UPDATE_NOTIFIED_FILE + ".tmp", UPDATE_NOTIFIED_FILE)
+    except OSError:
+        pass
+    return 0
+
+
+# --------------------------------------------------------------------------
 # commands
 
 def cmd_save(args):
@@ -1355,6 +1531,8 @@ def cmd_config(args):
         val = [v for v in val.split(",") if v]
     if key == "boot" and val not in ("auto", "ask"):
         raise SystemExit(f"{APP}: boot must be 'auto' or 'ask'")
+    if key == "update_check" and val not in ("on", "off"):
+        raise SystemExit(f"{APP}: update_check must be 'on' or 'off'")
     cfg[key] = val
     save_config(cfg)
     return 0
@@ -1373,6 +1551,8 @@ USAGE = """usage: omarchy-layout-swapper <command> [args]
   menu switch|save|delete|boot-mode   Omarchy menu pickers
   status [--json|--short]          active layout, daemon, boot mode
   config [key [value]]             show or set configuration
+  update-notify on|off|toggle      opt in/out of login update checks (default off)
+  update-check [--force] [--print] check the git remote for a newer version, notify what changed
 """
 
 
@@ -1385,6 +1565,7 @@ def main(argv):
         "save": cmd_save, "switch": cmd_switch, "restore": cmd_restore, "list": cmd_list,
         "show": cmd_show, "delete": cmd_delete, "rename": cmd_rename, "watch": cmd_watch,
         "boot": cmd_boot, "menu": cmd_menu, "status": cmd_status, "config": cmd_config,
+        "update-notify": cmd_update_notify, "update-check": cmd_update_check,
     }
     fn = table.get(cmd)
     if not fn:

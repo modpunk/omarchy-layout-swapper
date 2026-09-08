@@ -7,5 +7,6 @@
   "layouts.restore": {"icon":"󰑓","label":"Restore active layout","description":"Relaunch or move windows to match the active layout, keeping extras","action":"omarchy-layout-swapper restore"},
   "layouts.boot-auto": {"icon":"󰁯","label":"Restore at login automatically","checked":"[[ $(omarchy-layout-swapper config boot) == '\"auto\"' ]]","action":"omarchy-layout-swapper config boot auto"},
   "layouts.boot-ask": {"icon":"󰋗","label":"Ask which layout at login","checked":"[[ $(omarchy-layout-swapper config boot) == '\"ask\"' ]]","action":"omarchy-layout-swapper config boot ask"},
+  "layouts.notify": {"icon":"󰚰","label":"Notify me about updates","description":"Check for a new plugin version a few minutes after login (off by default)","checked":"[[ $(omarchy-layout-swapper config update_check) == '\"on\"' ]]","action":"omarchy-layout-swapper update-notify toggle"},
   "layouts.delete": {"icon":"󰆴","label":"Delete a layout","when":"[[ $(omarchy-layout-swapper list --json) != '[]' ]]","action":"omarchy-layout-swapper menu delete"},
   "layouts.show": {"icon":"󰈙","label":"Show layouts","description":"List layouts and the windows each one restores","action":"omarchy-launch-floating-terminal-with-presentation \"omarchy-layout-swapper list; echo; omarchy-layout-swapper show\""},
