@@ -1,0 +1,8 @@
+#!/bin/bash
+# Omarchy post-boot hook (fans.omarchy.layout-swapper): start the autosave
+# daemon and bring the last layout back (or ask which one, per
+# `omarchy-layout-swapper config boot`). Detached so the other post-boot
+# hooks are not held up while apps launch. install.sh fills in @BIN@.
+BIN="@BIN@"
+[[ -x $BIN ]] || BIN=$(command -v omarchy-layout-swapper 2>/dev/null) || exit 0
+nohup setsid "$BIN" boot >/dev/null 2>&1 &

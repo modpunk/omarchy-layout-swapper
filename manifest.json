@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "fans.omarchy.layout-swapper",
+  "name": "Layout Swapper",
+  "version": "0.1.0",
+  "author": "modpunk (omarchy.fans)",
+  "license": "MIT",
+  "description": "Save, switch, and auto-restore Hyprland window layouts. An autosave daemon keeps the active layout current, so after a power loss or reboot every app comes back on its workspace. Keep several named layouts and swap between them from the bar, the menu, or SUPER + ALT + L: the layout you leave is preserved (its windows are parked, not closed) and the one you pick is brought up.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Layout Swapper",
+    "description": "Shows the active layout; click to switch, right-click to save a new one, middle-click to set what happens at login.",
+    "category": "System",
+    "aliases": ["layout-swapper", "layouts", "session"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,22 @@
+name: validate
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: python syntax
+        run: python3 -m py_compile bin/omarchy-layout-swapper
+      - name: bash -n
+        run: bash -n install.sh uninstall.sh hooks/layout-swapper tests/run.sh
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck jq
+          shellcheck -S warning install.sh uninstall.sh hooks/layout-swapper tests/run.sh
+      - name: manifest
+        run: |
+          jq -e '.schemaVersion == 1 and (.id|startswith("omarchy.")|not) and (.entryPoints.barWidget|length>0)' manifest.json
+          test -f "$(jq -r .entryPoints.barWidget manifest.json)"
+          ! find . -path ./.git -prune -o -type l -print | grep .
+      - name: tests (offline, fake compositor)
+        run: tests/run.sh

@@ -1,0 +1,6 @@
+  // Layout Swapper — optional: snapshot the active layout right before the
+  // desktop tears its windows down. Omarchy has no pre-shutdown hook, but the
+  // menu's System entries can be overridden by reusing their ids.
+  "system.shutdown": {"action":"omarchy-layout-swapper save --quiet; omarchy-system-shutdown"},
+  "system.reboot": {"action":"omarchy-layout-swapper save --quiet; omarchy-system-reboot"},
+  "system.logout": {"action":"omarchy-layout-swapper save --quiet; omarchy-system-logout"},

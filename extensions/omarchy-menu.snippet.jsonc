@@ -1,0 +1,11 @@
+  // Layout Swapper (fans.omarchy.layout-swapper) — appended by install.sh
+  // inside ~/.config/omarchy/extensions/omarchy-menu.jsonc
+  "layouts": {"icon":"󰕰","label":"Layouts","aliases":["layout","layouts","session","workspace-layouts"],"description":"Save, switch, and auto-restore window layouts"},
+  "layouts.switch": {"icon":"󰓡","label":"Switch layout","description":"Save the current layout, park its windows, bring up another","action":"omarchy-layout-swapper menu switch"},
+  "layouts.save": {"icon":"󰆓","label":"Save current as…","description":"Store the open windows under a new layout name","action":"omarchy-layout-swapper menu save"},
+  "layouts.save-now": {"icon":"","label":"Save now","description":"Snapshot into the active layout right away","action":"omarchy-layout-swapper save && omarchy-notification-send 'Layout saved'"},
+  "layouts.restore": {"icon":"󰑓","label":"Restore active layout","description":"Relaunch or move windows to match the active layout, keeping extras","action":"omarchy-layout-swapper restore"},
+  "layouts.boot-auto": {"icon":"󰁯","label":"Restore at login automatically","checked":"[[ $(omarchy-layout-swapper config boot) == '\"auto\"' ]]","action":"omarchy-layout-swapper config boot auto"},
+  "layouts.boot-ask": {"icon":"󰋗","label":"Ask which layout at login","checked":"[[ $(omarchy-layout-swapper config boot) == '\"ask\"' ]]","action":"omarchy-layout-swapper config boot ask"},
+  "layouts.delete": {"icon":"󰆴","label":"Delete a layout","when":"[[ $(omarchy-layout-swapper list --json) != '[]' ]]","action":"omarchy-layout-swapper menu delete"},
+  "layouts.show": {"icon":"󰈙","label":"Show layouts","description":"List layouts and the windows each one restores","action":"omarchy-launch-floating-terminal-with-presentation \"omarchy-layout-swapper list; echo; omarchy-layout-swapper show\""},

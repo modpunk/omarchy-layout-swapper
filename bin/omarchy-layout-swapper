@@ -1,0 +1,1400 @@
+#!/usr/bin/env python3
+# omarchy-layout-swapper — save, switch, and auto-restore Hyprland window
+# layouts on Omarchy.
+#
+#   omarchy-layout-swapper save [name] [--force]     snapshot the current layout
+#   omarchy-layout-swapper switch <name>             save current, park it, bring up <name>
+#   omarchy-layout-swapper restore [name] [--keep|--close]
+#   omarchy-layout-swapper list | show [name] | delete <name> | rename <a> <b>
+#   omarchy-layout-swapper watch                     autosave daemon (Hyprland IPC events)
+#   omarchy-layout-swapper boot                      start watch, then auto-restore or ask
+#   omarchy-layout-swapper menu switch|save|delete|boot-mode
+#   omarchy-layout-swapper status [--json|--short]
+#
+# Stdlib only. Hyprland >= 0.55 (Lua dispatchers), with legacy string
+# dispatchers as a fallback, the same idiom Omarchy's own scripts use.
+#
+# A layout is a JSON list of window records: class, workspace, geometry,
+# floating/pinned/fullscreen state, and a launch command derived at save time
+# (web apps from the desktop-file index, terminals from the child shell's cwd,
+# native apps from /proc). Restore is a reconcile: existing windows are
+# claimed and moved into place, missing ones are launched one at a time and
+# matched as they open, extras are kept, closed, or parked on a hidden
+# per-layout special workspace so switching back is instant.
+
+import glob
+import json
+import os
+import re
+import select
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+APP = "omarchy-layout-swapper"
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get(
+    "LAYOUT_SWAPPER_CONFIG_DIR",
+    os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), APP),
+)
+STATE_DIR = os.environ.get(
+    "LAYOUT_SWAPPER_STATE_DIR",
+    os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")), APP),
+)
+LAYOUTS_DIR = os.path.join(CONFIG_DIR, "layouts")
+BACKUP_DIR = os.path.join(STATE_DIR, "backups")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+ACTIVE_FILE = os.path.join(STATE_DIR, "active")
+PID_FILE = os.path.join(STATE_DIR, "watch.pid")
+LOCK_FILE = os.path.join(STATE_DIR, "restore.lock")
+LOG_FILE = os.path.join(STATE_DIR, "watch.log")
+PROC = os.environ.get("LAYOUT_SWAPPER_PROC", "/proc")
+# Test hook: a directory with clients.json / monitors.json / activeworkspace.json
+# and a dispatch.log that records what would have been dispatched.
+FAKE_DIR = os.environ.get("LAYOUT_SWAPPER_FAKE_DIR")
+APPS_DIRS = os.environ.get(
+    "LAYOUT_SWAPPER_APPS_DIRS",
+    os.pathsep.join(
+        [
+            os.path.join(HOME, ".local", "share", "applications"),
+            os.path.join(HOME, ".nix-profile", "share", "applications"),
+            "/usr/share/applications",
+        ]
+    ),
+).split(os.pathsep)
+BINDINGS_FILES = os.environ.get(
+    "LAYOUT_SWAPPER_BINDINGS",
+    os.pathsep.join(
+        [
+            os.path.join(HOME, ".config", "hypr", "bindings.lua"),
+            "/usr/share/omarchy/default/hypr/bindings/applications.lua",
+        ]
+    ),
+).split(os.pathsep)
+
+DEFAULT_CONFIG = {
+    "boot": "auto",  # auto | ask
+    "autosave_seconds": 5,
+    "periodic_seconds": 60,
+    "launch_timeout": 12,
+    "backups": 5,
+    "default_layout": "main",
+    # Transient / shell windows never worth restoring.
+    "ignore_classes": [
+        "org.omarchy.menu",
+        "org.omarchy.osd",
+        "org.omarchy.shell",
+        "org.omarchy.about",
+        "org.omarchy.launcher",
+        "omarchy-shell",
+        "quickshell",
+        "hyprland-share-picker",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-portal-hyprland",
+        "TUI.float",
+        "Walker",
+        "walker",
+    ],
+}
+
+PARK_PREFIX = "special:ls-"
+BROWSER_CLASSES = {
+    "chromium",
+    "Chromium",
+    "google-chrome",
+    "Google-chrome",
+    "brave-browser",
+    "Brave-browser",
+    "helium",
+    "Helium",
+    "microsoft-edge",
+    "vivaldi",
+    "opera",
+}
+TERMINAL_EXES = {"foot", "footclient", "alacritty", "kitty", "ghostty", "wezterm-gui", "wezterm"}
+TUI_LAUNCHERS = {"tmux": "tmux", "herdr": "herdr"}
+
+
+# --------------------------------------------------------------------------
+# small helpers
+
+def log(msg):
+    sys.stderr.write(f"{APP}: {msg}\n")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def ensure_dirs():
+    for d in (CONFIG_DIR, LAYOUTS_DIR, STATE_DIR, BACKUP_DIR):
+        os.makedirs(d, exist_ok=True)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json_atomic(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    user = read_json(CONFIG_FILE, {}) or {}
+    cfg.update(user)
+    return cfg
+
+
+def save_config(cfg):
+    ensure_dirs()
+    write_json_atomic(CONFIG_FILE, cfg)
+
+
+def valid_name(name):
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", name or ""))
+
+
+def layout_path(name):
+    return os.path.join(LAYOUTS_DIR, f"{name}.json")
+
+
+def list_layouts():
+    names = [os.path.basename(p)[:-5] for p in glob.glob(os.path.join(LAYOUTS_DIR, "*.json"))]
+    return sorted(names, key=str.lower)
+
+
+def load_layout(name):
+    data = read_json(layout_path(name))
+    if not data:
+        raise SystemExit(f"{APP}: no layout named '{name}'")
+    return data
+
+
+def get_active():
+    try:
+        with open(ACTIVE_FILE, encoding="utf-8") as f:
+            name = f.read().strip()
+        if valid_name(name):
+            return name
+    except OSError:
+        pass
+    return load_config()["default_layout"]
+
+
+def set_active(name):
+    ensure_dirs()
+    with open(ACTIVE_FILE + ".tmp", "w", encoding="utf-8") as f:
+        f.write(name + "\n")
+    os.replace(ACTIVE_FILE + ".tmp", ACTIVE_FILE)
+
+
+def notify(title, body=""):
+    if FAKE_DIR:
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "Layout Swapper", title, body], check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+# --------------------------------------------------------------------------
+# /proc access (overridable for tests)
+
+def proc_read(pid, name):
+    try:
+        with open(os.path.join(PROC, str(pid), name), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def proc_cmdline(pid):
+    raw = proc_read(pid, "cmdline")
+    if not raw:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def proc_link(pid, name):
+    try:
+        return os.readlink(os.path.join(PROC, str(pid), name))
+    except OSError:
+        # Test fixtures store links as plain files.
+        raw = proc_read(pid, name)
+        return raw.decode("utf-8", "replace").strip() if raw else None
+
+
+def proc_exe(pid):
+    exe = proc_link(pid, "exe") or ""
+    return exe.split(" (deleted)")[0]
+
+
+def proc_stat_fields(pid):
+    raw = proc_read(pid, "stat")
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace")
+    # comm may contain spaces/parens: split after the last ')'.
+    rest = text[text.rfind(")") + 2:].split()
+    # rest[0]=state rest[1]=ppid rest[2]=pgrp rest[3]=session rest[4]=tty rest[5]=tpgid
+    try:
+        return {"ppid": int(rest[1]), "pgrp": int(rest[2]), "tpgid": int(rest[5])}
+    except (IndexError, ValueError):
+        return None
+
+
+def proc_children_map():
+    children = {}
+    try:
+        entries = os.listdir(PROC)
+    except OSError:
+        return children
+    for e in entries:
+        if not e.isdigit():
+            continue
+        st = proc_stat_fields(int(e))
+        if st:
+            children.setdefault(st["ppid"], []).append(int(e))
+    for kids in children.values():
+        kids.sort()
+    return children
+
+
+def descendants(pid, cmap):
+    out = []
+    stack = list(cmap.get(pid, []))
+    while stack:
+        p = stack.pop(0)
+        out.append(p)
+        stack.extend(cmap.get(p, []))
+    return out
+
+
+_SHELLS = None
+
+
+def known_shells():
+    global _SHELLS
+    if _SHELLS is None:
+        _SHELLS = set()
+        try:
+            with open("/etc/shells", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        _SHELLS.add(line)
+                        _SHELLS.add(os.path.basename(line))
+        except OSError:
+            pass
+        _SHELLS.update({"bash", "zsh", "fish", "sh", "nu", "elvish"})
+    return _SHELLS
+
+
+def is_shell(exe):
+    return exe in known_shells() or os.path.basename(exe) in known_shells()
+
+
+# --------------------------------------------------------------------------
+# Hyprland access
+
+class Hypr:
+    """hyprctl wrapper. With LAYOUT_SWAPPER_FAKE_DIR set, reads JSON fixtures and
+    appends dispatches to dispatch.log instead of talking to a compositor."""
+
+    def __init__(self):
+        self.fake = FAKE_DIR
+
+    def _json(self, *args):
+        if self.fake:
+            return read_json(os.path.join(self.fake, args[0] + ".json"), [])
+        try:
+            out = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True, timeout=10, check=True).stdout
+            return json.loads(out or "null")
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            raise SystemExit(f"{APP}: hyprctl {' '.join(args)} failed: {e}")
+
+    def clients(self):
+        return [c for c in (self._json("clients") or []) if isinstance(c, dict)]
+
+    def monitors(self):
+        return self._json("monitors") or []
+
+    def active_workspace(self):
+        ws = self._json("activeworkspace") or {}
+        return ws.get("name") if isinstance(ws, dict) else None
+
+    def monitor_names(self):
+        return {m.get("id"): m.get("name") for m in self.monitors()}
+
+    def dispatch(self, lua, legacy=None):
+        """Run a Lua dispatcher; fall back to a legacy string dispatcher."""
+        if self.fake:
+            with open(os.path.join(self.fake, "dispatch.log"), "a", encoding="utf-8") as f:
+                f.write(lua + "\n")
+            return True
+        try:
+            r = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip() == "ok":
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if legacy:
+            try:
+                r = subprocess.run(["hyprctl", "dispatch", *legacy], capture_output=True, text=True, timeout=10)
+                return r.returncode == 0 and r.stdout.strip() == "ok"
+            except (OSError, subprocess.SubprocessError):
+                return False
+        return False
+
+    def socket2_path(self):
+        if os.environ.get("LAYOUT_SWAPPER_SOCKET"):
+            return os.environ["LAYOUT_SWAPPER_SOCKET"]
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        run = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        if not sig:
+            return None
+        return os.path.join(run, "hypr", sig, ".socket2.sock")
+
+
+def lua_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def lua_long(s):
+    # [[...]] long string; a ']]' inside would end it early, so escape by level.
+    level = 0
+    while f"]{'=' * level}]" in s:
+        level += 1
+    eq = "=" * level
+    return f"[{eq}[{s}]{eq}]"
+
+
+# --------------------------------------------------------------------------
+# launch command derivation
+
+_WEBAPP_INDEX = None
+
+
+def webapp_key(url):
+    """Chromium's --app window class body: host + '_' + path with every char
+    outside [A-Za-z0-9.-] replaced by '_' (so https://grok.com -> grok.com__)."""
+    u = urlparse(url if "://" in url else "https://" + url)
+    host = u.netloc.lower()
+    path = u.path or "/"
+    return re.sub(r"[^A-Za-z0-9.\-]", "_", host + "_" + path)
+
+
+def webapp_index():
+    """class body -> url, from Omarchy web-app desktop files and Hyprland bindings."""
+    global _WEBAPP_INDEX
+    if _WEBAPP_INDEX is not None:
+        return _WEBAPP_INDEX
+    idx = {}
+    for d in APPS_DIRS:
+        for path in glob.glob(os.path.join(d, "*.desktop")):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("Exec=") and "omarchy-launch-webapp" in line:
+                            try:
+                                parts = shlex.split(line[5:].strip())
+                            except ValueError:
+                                continue
+                            urls = [p for p in parts[1:] if "://" in p]
+                            if urls:
+                                idx.setdefault(webapp_key(urls[0]), urls[0])
+                            break
+            except OSError:
+                continue
+    for path in BINDINGS_FILES:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for m in re.finditer(r'webapp\s*=\s*"([^"]+)"', f.read()):
+                    idx.setdefault(webapp_key(m.group(1)), m.group(1))
+        except OSError:
+            continue
+    _WEBAPP_INDEX = idx
+    return idx
+
+
+def invert_webapp_key(key):
+    """Best-effort inverse of webapp_key: 'grok.com__' -> https://grok.com/"""
+    host, _, rest = key.partition("_")
+    path = rest.lstrip("_").replace("_", "/")
+    return f"https://{host}/{path}"
+
+
+def profile_dir_from_suffix(suffix):
+    # 'Profile_1' -> 'Profile 1'; 'Default' -> 'Default'
+    return suffix.replace("_", " ")
+
+
+_BROWSER_CMD = None
+
+
+def browser_command(argv0=None):
+    """The browser launcher on PATH (never the raw binary under /usr/lib, which
+    would skip the chromium-flags.conf wrapper)."""
+    global _BROWSER_CMD
+    if argv0:
+        base = os.path.basename(argv0).lower()
+        for needle, cmd in (("chromium", "chromium"), ("brave", "brave"), ("chrome", "google-chrome-stable"), ("helium", "helium")):
+            if needle in base:
+                return cmd
+    if _BROWSER_CMD is None:
+        _BROWSER_CMD = "chromium"
+        try:
+            desktop = subprocess.run(["xdg-settings", "get", "default-web-browser"], capture_output=True, text=True, timeout=5).stdout.strip()
+            for d in APPS_DIRS:
+                p = os.path.join(d, desktop)
+                if desktop and os.path.isfile(p):
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            if line.startswith("Exec="):
+                                _BROWSER_CMD = shlex.split(line[5:].strip())[0]
+                                break
+                    break
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
+    return _BROWSER_CMD
+
+
+def derive_launch(client, cmap):
+    """Return {'kind', 'cmd', 'cwd'?, 'profile'?} for a hyprctl client record."""
+    cls = client.get("class") or client.get("initialClass") or ""
+    pid = int(client.get("pid") or 0)
+    argv = proc_cmdline(pid) if pid > 0 else []
+    exe = proc_exe(pid) if pid > 0 else ""
+
+    # Chromium PWA (installed app): chrome-<32 char crx id>-<Profile>
+    m = re.fullmatch(r"chrome-([a-p]{32})-(Default|Profile_\d+)", cls)
+    if m:
+        profile = profile_dir_from_suffix(m.group(2))
+        cmd = f"{browser_command(argv[0] if argv else None)} --profile-directory={shlex.quote(profile)} --app-id={m.group(1)}"
+        return {"kind": "pwa", "cmd": cmd, "profile": profile}
+
+    # Omarchy web app: chrome-<host>__<path>-<Profile>
+    m = re.fullmatch(r"chrome-(.+)-(Default|Profile_\d+)", cls)
+    if m:
+        key, profile = m.group(1), profile_dir_from_suffix(m.group(2))
+        url = webapp_index().get(key) or invert_webapp_key(key)
+        cmd = f"omarchy-launch-webapp {shlex.quote(url)} --profile-directory={shlex.quote(profile)}"
+        return {"kind": "webapp", "cmd": cmd, "url": url, "profile": profile}
+
+    # Regular browser window: tabs come back through the browser's own
+    # session restore; we only know how to open another window.
+    if cls in BROWSER_CLASSES or (argv and any("chrom" in a or "brave" in a for a in argv[:1])):
+        return {"kind": "chromium", "cmd": f"{browser_command(argv[0] if argv else None)} --new-window"}
+
+    # Terminal emulators: the useful state is the child's cwd / command.
+    if pid > 0 and (os.path.basename(exe) in TERMINAL_EXES or (argv and os.path.basename(argv[0]) in TERMINAL_EXES)):
+        return derive_terminal_launch(cls, pid, cmap)
+
+    if pid > 0 and argv:
+        cwd = proc_link(pid, "cwd") or HOME
+        return {"kind": "native", "cmd": shlex.join(argv), "cwd": cwd}
+
+    return {"kind": "unknown", "cmd": None}
+
+
+def derive_terminal_launch(cls, pid, cmap):
+    kids = cmap.get(pid, [])
+    child = kids[0] if kids else None
+    cwd = HOME
+    inner = None  # argv list to run inside the terminal
+    kind = "terminal"
+    if child:
+        cexe = proc_exe(child)
+        cargv = proc_cmdline(child)
+        cwd = proc_link(child, "cwd") or cwd
+        if (is_shell(cexe) or (cargv and is_shell(cargv[0]))) and "-c" in cargv[1:3]:
+            # `sh -c "..."` wrapper (Omarchy's tmux launcher, TUI menus): replay
+            # the same command line.
+            inner = cargv
+            joined = " ".join(cargv)
+            for needle, k in TUI_LAUNCHERS.items():
+                if re.search(r"\b" + needle + r"\b", joined):
+                    kind = k
+        elif is_shell(cexe) or (cargv and is_shell(cargv[0])):
+            # Interactive shell: if a foreground job is running, note it so we
+            # can relaunch it and drop back into a shell afterwards.
+            st = proc_stat_fields(child)
+            fg = None
+            if st and st["tpgid"] not in (-1, 0, st["pgrp"]):
+                for d in descendants(child, cmap):
+                    dst = proc_stat_fields(d)
+                    if dst and dst["pgrp"] == st["tpgid"]:
+                        fg = d
+                        break
+            if fg:
+                fargv = proc_cmdline(fg)
+                cwd = proc_link(fg, "cwd") or cwd
+                if fargv:
+                    shell = os.path.basename(cexe) if cexe else "bash"
+                    inner = [shell, "-c", shlex.join(fargv) + f"; exec {shell}"]
+        else:
+            base = os.path.basename(cargv[0]) if cargv else os.path.basename(cexe)
+            if base in TUI_LAUNCHERS:
+                kind = TUI_LAUNCHERS[base]
+                if base == "tmux":
+                    inner = ["bash", "-c", "tmux attach || tmux new -s Work"]
+                else:
+                    inner = [base]
+            else:
+                if cargv:
+                    inner = cargv
+                if cls == "org.omarchy.agent":
+                    kind = "agent"
+    cmd = f"xdg-terminal-exec --app-id={shlex.quote(cls)} --dir={shlex.quote(cwd)}"
+    if inner:
+        cmd += " -e " + shlex.join(inner)
+    return {"kind": kind, "cmd": cmd, "cwd": cwd}
+
+
+# --------------------------------------------------------------------------
+# snapshot
+
+def is_ignored(client, cfg):
+    cls = client.get("class") or client.get("initialClass") or ""
+    if not cls:
+        return True
+    if cls in cfg["ignore_classes"]:
+        return True
+    ws = (client.get("workspace") or {}).get("name") or ""
+    if ws.startswith(PARK_PREFIX):
+        return True
+    if not client.get("mapped", True) or client.get("hidden", False):
+        return True
+    return False
+
+
+def snapshot(hypr, cfg):
+    cmap = proc_children_map()
+    mon_names = hypr.monitor_names()
+    records = []
+    for c in hypr.clients():
+        if is_ignored(c, cfg):
+            continue
+        cls = c.get("class") or c.get("initialClass") or ""
+        ws = (c.get("workspace") or {}).get("name") or "1"
+        fs = c.get("fullscreen", 0)
+        if isinstance(fs, bool):
+            fs = 2 if fs else 0
+        rec = {
+            "class": cls,
+            "initial_class": c.get("initialClass") or cls,
+            "title": c.get("title") or "",
+            "workspace": ws,
+            "monitor": mon_names.get(c.get("monitor"), str(c.get("monitor", ""))),
+            "at": list(c.get("at") or [0, 0]),
+            "size": list(c.get("size") or [0, 0]),
+            "floating": bool(c.get("floating", False)),
+            "fullscreen": int(fs or 0),
+            "pinned": bool(c.get("pinned", False)),
+            "focus_history": c.get("focusHistoryID", 999),
+            "stable_id": c.get("stableId") or "",
+            "address": c.get("address") or "",
+            "pid": c.get("pid") or 0,
+            "launch": derive_launch(c, cmap),
+            "match": {"class": "^" + re.escape(cls) + "$"},
+        }
+        records.append(rec)
+    # Restore order: by workspace, then the layout's left-to-right order.
+    records.sort(key=lambda r: (ws_sort_key(r["workspace"]), r["at"][0], r["at"][1]))
+    return {
+        "name": None,
+        "saved_at": now_iso(),
+        "active_workspace": hypr.active_workspace(),
+        "monitors": [m.get("name") for m in hypr.monitors()],
+        "windows": records,
+    }
+
+
+def ws_sort_key(name):
+    try:
+        return (0, int(name))
+    except ValueError:
+        return (1, name)
+
+
+def rotate_backups(name, cfg):
+    old = layout_path(name)
+    if not os.path.exists(old):
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"{name}.{stamp}.json")
+    try:
+        with open(old, "rb") as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+    except OSError:
+        return
+    backups = sorted(glob.glob(os.path.join(BACKUP_DIR, f"{name}.*.json")))
+    for p in backups[: max(0, len(backups) - int(cfg["backups"]))]:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def save_layout(name, hypr=None, cfg=None, force=False, quiet=False):
+    """Snapshot into <name>. Refuses to replace a non-empty layout with an
+    empty one (a compositor teardown looks exactly like that) unless forced."""
+    cfg = cfg or load_config()
+    hypr = hypr or Hypr()
+    if not valid_name(name):
+        raise SystemExit(f"{APP}: invalid layout name '{name}'")
+    ensure_dirs()
+    snap = snapshot(hypr, cfg)
+    snap["name"] = name
+    existing = read_json(layout_path(name))
+    if not snap["windows"] and existing and existing.get("windows") and not force:
+        if not quiet:
+            log(f"refusing to overwrite '{name}' ({len(existing['windows'])} windows) with an empty snapshot; use --force")
+        return None
+    if existing and existing.get("windows") != snap["windows"]:
+        rotate_backups(name, cfg)
+    write_json_atomic(layout_path(name), snap)
+    if not quiet:
+        print(f"saved '{name}': {len(snap['windows'])} windows")
+    return snap
+
+
+# --------------------------------------------------------------------------
+# restore / reconcile
+
+class Lock:
+    def __enter__(self):
+        ensure_dirs()
+        if os.path.exists(LOCK_FILE):
+            try:
+                age = time.time() - os.path.getmtime(LOCK_FILE)
+            except OSError:
+                age = 0
+            if age < 120:
+                raise SystemExit(f"{APP}: a restore is already running ({LOCK_FILE})")
+        with open(LOCK_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            os.unlink(LOCK_FILE)
+        except OSError:
+            pass
+
+
+def lock_held():
+    try:
+        return time.time() - os.path.getmtime(LOCK_FILE) < 120
+    except OSError:
+        return False
+
+
+def client_class(c):
+    return c.get("class") or c.get("initialClass") or ""
+
+
+def claim_windows(records, clients, claimed, used):
+    """Match saved records to live windows. Passes: stable_id, class+title, class."""
+    def take(i, c):
+        claimed[i] = c["address"]
+        used.add(c["address"])
+
+    live = [c for c in clients if c.get("address") and c["address"] not in used]
+    for i, r in enumerate(records):
+        if i in claimed or not r.get("stable_id"):
+            continue
+        for c in live:
+            if c["address"] not in used and c.get("stableId") == r["stable_id"]:
+                take(i, c)
+                break
+    for pass_title in (True, False):
+        for i, r in enumerate(records):
+            if i in claimed:
+                continue
+            pat = re.compile(r["match"]["class"])
+            for c in live:
+                if c["address"] in used or not pat.fullmatch(client_class(c)):
+                    continue
+                if pass_title and (c.get("title") or "") != r.get("title", ""):
+                    continue
+                take(i, c)
+                break
+
+
+def place_window(hypr, rec, addr):
+    ws = rec["workspace"]
+    a = f"address:{addr}"
+    hypr.dispatch(
+        f"hl.dsp.window.move({{ window = {lua_str(a)}, workspace = {lua_str(ws)}, follow = false }})",
+        ["movetoworkspacesilent", f"{ws},{a}"],
+    )
+    if rec.get("floating"):
+        hypr.dispatch(f"hl.dsp.window.float({{ window = {lua_str(a)}, action = \"set\" }})", ["setfloating", a])
+        w, h = rec.get("size") or [0, 0]
+        x, y = rec.get("at") or [0, 0]
+        if w and h:
+            hypr.dispatch(
+                f"hl.dsp.window.resize({{ window = {lua_str(a)}, x = {int(w)}, y = {int(h)}, relative = false }})",
+                ["resizewindowpixel", f"exact {int(w)} {int(h)},{a}"],
+            )
+            hypr.dispatch(
+                f"hl.dsp.window.move({{ window = {lua_str(a)}, x = {int(x)}, y = {int(y)}, relative = false }})",
+                ["movewindowpixel", f"exact {int(x)} {int(y)},{a}"],
+            )
+        if rec.get("pinned"):
+            hypr.dispatch(f"hl.dsp.window.pin({{ window = {lua_str(a)}, action = \"set\" }})", ["pin", a])
+    else:
+        hypr.dispatch(f"hl.dsp.window.float({{ window = {lua_str(a)}, action = \"unset\" }})")
+    fs = int(rec.get("fullscreen") or 0)
+    if fs:
+        hypr.dispatch(
+            f"hl.dsp.window.fullscreen_state({{ window = {lua_str(a)}, internal = {fs}, client = 0 }})",
+            ["fullscreenstate", f"{fs} 0,{a}"],
+        )
+
+
+def exec_rules(rec):
+    rules = [f"workspace = {lua_str(rec['workspace'] + ' silent')}"]
+    if rec.get("floating"):
+        rules.append("float = true")
+        w, h = rec.get("size") or [0, 0]
+        x, y = rec.get("at") or [0, 0]
+        if w and h:
+            rules.append(f"size = {{{int(w)}, {int(h)}}}")
+            rules.append(f"move = {{{int(x)}, {int(y)}}}")
+    return "{ " + ", ".join(rules) + " }"
+
+
+def launch(hypr, rec):
+    cmd = rec["launch"]["cmd"]
+    cwd = rec["launch"].get("cwd")
+    shell_cmd = cmd
+    if cwd and rec["launch"].get("kind") == "native":
+        shell_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
+    if rec["launch"].get("kind") in ("native", "terminal", "agent", "tmux", "herdr"):
+        shell_cmd = "uwsm-app -- " + shell_cmd
+    return hypr.dispatch(
+        f"hl.dsp.exec_cmd({lua_long(shell_cmd)}, {exec_rules(rec)})",
+        ["exec", shell_cmd],
+    )
+
+
+def wait_for_window(hypr, rec, known, timeout):
+    """Poll clients until a new window matching the record's class appears."""
+    pat = re.compile(rec["match"]["class"])
+    kind = rec["launch"].get("kind")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for c in hypr.clients():
+            addr = c.get("address")
+            if not addr or addr in known:
+                continue
+            cls = client_class(c)
+            if pat.fullmatch(cls) or (kind == "chromium" and cls in BROWSER_CLASSES):
+                if c.get("mapped", True):
+                    return addr
+        if FAKE_DIR:
+            break
+        time.sleep(0.25)
+    return None
+
+
+def browser_running():
+    if FAKE_DIR:
+        return os.path.exists(os.path.join(FAKE_DIR, "browser-running"))
+    try:
+        entries = os.listdir(PROC)
+    except OSError:
+        return False
+    for e in entries:
+        if e.isdigit():
+            argv = proc_cmdline(int(e))
+            if argv and re.search(r"(chromium|chrome|brave|helium)", os.path.basename(argv[0])) and "--type=" not in " ".join(argv[1:3]):
+                return True
+    return False
+
+
+def wait_settle(hypr, quiet=2.0, maximum=20.0):
+    """Wait until no new windows appear for `quiet` seconds."""
+    if FAKE_DIR:
+        return
+    start = time.time()
+    last_change = start
+    seen = {c.get("address") for c in hypr.clients()}
+    while time.time() - start < maximum:
+        time.sleep(0.5)
+        cur = {c.get("address") for c in hypr.clients()}
+        if cur != seen:
+            seen, last_change = cur, time.time()
+        elif time.time() - last_change >= quiet:
+            return
+
+
+def reconcile(layout, mode="keep", park_as=None, hypr=None, cfg=None):
+    """Bring `layout` up. mode: keep | close | park (extras go to special:ls-<park_as>)."""
+    cfg = cfg or load_config()
+    hypr = hypr or Hypr()
+    records = layout.get("windows") or []
+    summary = {"claimed": 0, "launched": 0, "missing": [], "extras": 0}
+    with Lock():
+        clients = hypr.clients()
+        claimed, used = {}, set()
+        claim_windows(records, clients, claimed, used)
+
+        # Browser first: with its own session restore on, one launch brings
+        # back every regular window (and its tabs); then re-claim by class.
+        browser_idx = [i for i, r in enumerate(records) if r["launch"].get("kind") in ("chromium", "webapp", "pwa")]
+        if any(i not in claimed for i in browser_idx) and not browser_running():
+            profiles = []
+            for i in browser_idx:
+                p = records[i]["launch"].get("profile")
+                if p and p not in profiles:
+                    profiles.append(p)
+            for p in profiles or [None]:
+                cmd = browser_command()
+                if p:
+                    cmd += f" --profile-directory={shlex.quote(p)}"
+                hypr.dispatch(f"hl.dsp.exec_cmd({lua_long(cmd)})", ["exec", cmd])
+            wait_settle(hypr)
+            clients = hypr.clients()
+            claim_windows(records, clients, claimed, used)
+
+        # Launch what is still missing, one at a time, and catch each window
+        # as it opens (exec rules match by PID, which single-process apps break).
+        for i, rec in enumerate(records):
+            if i in claimed:
+                continue
+            if not rec["launch"].get("cmd"):
+                summary["missing"].append(rec["class"])
+                continue
+            known = {c.get("address") for c in hypr.clients()} | used
+            if not launch(hypr, rec):
+                summary["missing"].append(rec["class"])
+                continue
+            addr = wait_for_window(hypr, rec, known, float(cfg["launch_timeout"]))
+            if addr:
+                claimed[i] = addr
+                used.add(addr)
+                summary["launched"] += 1
+            else:
+                summary["missing"].append(rec["class"])
+
+        summary["claimed"] = len(claimed) - summary["launched"]
+        for i, addr in claimed.items():
+            place_window(hypr, records[i], addr)
+
+        # Extras: live windows the layout does not mention.
+        if mode in ("close", "park"):
+            for c in hypr.clients():
+                addr = c.get("address")
+                if not addr or addr in used or is_ignored(c, cfg):
+                    continue
+                a = lua_str(f"address:{addr}")
+                summary["extras"] += 1
+                if mode == "close":
+                    hypr.dispatch(f"hl.dsp.window.close({{ window = {a} }})", ["closewindow", f"address:{addr}"])
+                else:
+                    ws = PARK_PREFIX + (park_as or "parked")
+                    hypr.dispatch(
+                        f"hl.dsp.window.move({{ window = {a}, workspace = {lua_str(ws)}, follow = false }})",
+                        ["movetoworkspacesilent", f"{ws},address:{addr}"],
+                    )
+
+        target = layout.get("active_workspace")
+        if target and not str(target).startswith("special:"):
+            hypr.dispatch(f"hl.dsp.focus({{ workspace = {lua_str(str(target))} }})", ["workspace", str(target)])
+    return summary
+
+
+def describe(summary, name):
+    parts = []
+    if summary["claimed"]:
+        parts.append(f"{summary['claimed']} moved")
+    if summary["launched"]:
+        parts.append(f"{summary['launched']} launched")
+    if summary["missing"]:
+        parts.append(f"{len(summary['missing'])} missing")
+    if summary["extras"]:
+        parts.append(f"{summary['extras']} parked/closed")
+    return f"layout '{name}': " + (", ".join(parts) if parts else "nothing to do")
+
+
+# --------------------------------------------------------------------------
+# commands
+
+def cmd_save(args):
+    force = "--force" in args
+    quiet = "--quiet" in args
+    names = [a for a in args if not a.startswith("--")]
+    name = names[0] if names else get_active()
+    snap = save_layout(name, force=force, quiet=quiet)
+    if snap is None:
+        return 2
+    if "--no-activate" not in args:
+        set_active(name)
+    return 0
+
+
+def cmd_restore(args):
+    mode = "close" if "--close" in args else "keep"
+    names = [a for a in args if not a.startswith("--")]
+    if "--from-backup" in args:
+        i = args.index("--from-backup")
+        which = args[i + 1] if i + 1 < len(args) and args[i + 1].isdigit() else "latest"
+        if which != "latest" and which in names:
+            names.remove(which)
+    name = names[0] if names else get_active()
+    if "--from-backup" in args:
+        backups = sorted(glob.glob(os.path.join(BACKUP_DIR, f"{name}.*.json")))
+        if not backups:
+            raise SystemExit(f"{APP}: no backups for '{name}'")
+        path = backups[-1] if which == "latest" else backups[-int(which)]
+        layout = read_json(path)
+    else:
+        layout = load_layout(name)
+    summary = reconcile(layout, mode=mode)
+    msg = describe(summary, name)
+    print(msg)
+    notify("Layout restored", msg)
+    return 0 if not summary["missing"] else 1
+
+
+def cmd_switch(args):
+    names = [a for a in args if not a.startswith("--")]
+    if not names:
+        raise SystemExit("usage: omarchy-layout-swapper switch <name>")
+    name = names[0]
+    if not valid_name(name):
+        raise SystemExit(f"{APP}: invalid layout name '{name}'")
+    old = get_active()
+    if not os.path.exists(layout_path(name)):
+        raise SystemExit(f"{APP}: no layout named '{name}' (save one first: omarchy-layout-swapper save {shlex.quote(name)})")
+    if name == old:
+        return cmd_restore([name])
+    # Preserve the layout we are leaving, then bring up the new one and park
+    # everything that is not part of it under special:ls-<old>.
+    save_layout(old, quiet=True)
+    set_active(name)
+    summary = reconcile(load_layout(name), mode="park", park_as=old)
+    msg = describe(summary, name)
+    print(msg)
+    notify(f"Switched to '{name}'", msg)
+    return 0
+
+
+def cmd_list(args):
+    active = get_active()
+    rows = []
+    for n in list_layouts():
+        data = read_json(layout_path(n), {}) or {}
+        rows.append({"name": n, "active": n == active, "windows": len(data.get("windows") or []), "saved_at": data.get("saved_at")})
+    if "--json" in args:
+        print(json.dumps(rows))
+        return 0
+    for r in rows:
+        print(f"{'*' if r['active'] else ' '} {r['name']:<24} {r['windows']:>3} windows   {r['saved_at'] or ''}")
+    return 0
+
+
+def cmd_show(args):
+    names = [a for a in args if not a.startswith("--")]
+    name = names[0] if names else get_active()
+    layout = load_layout(name)
+    if "--json" in args:
+        print(json.dumps(layout, indent=2))
+        return 0
+    print(f"{name}  (saved {layout.get('saved_at')}, {len(layout.get('windows') or [])} windows)")
+    for r in layout.get("windows") or []:
+        flags = []
+        if r.get("floating"):
+            flags.append(f"float {r['size'][0]}x{r['size'][1]}@{r['at'][0]},{r['at'][1]}")
+        if r.get("fullscreen"):
+            flags.append("fullscreen")
+        if r.get("pinned"):
+            flags.append("pinned")
+        print(f"  ws {r['workspace']:<18} {r['class']:<36} {r['launch'].get('kind', '?'):<9} {' '.join(flags)}")
+        print(f"     {r['launch'].get('cmd') or '(cannot relaunch)'}")
+    return 0
+
+
+def cmd_delete(args):
+    names = [a for a in args if not a.startswith("--")]
+    if not names:
+        raise SystemExit("usage: omarchy-layout-swapper delete <name>")
+    name = names[0]
+    if name == get_active() and "--force" not in args:
+        raise SystemExit(f"{APP}: '{name}' is the active layout; switch first or use --force")
+    try:
+        os.unlink(layout_path(name))
+    except FileNotFoundError:
+        raise SystemExit(f"{APP}: no layout named '{name}'")
+    print(f"deleted '{name}'")
+    return 0
+
+
+def cmd_rename(args):
+    if len(args) < 2:
+        raise SystemExit("usage: omarchy-layout-swapper rename <old> <new>")
+    old, new = args[0], args[1]
+    if not valid_name(new):
+        raise SystemExit(f"{APP}: invalid layout name '{new}'")
+    if os.path.exists(layout_path(new)):
+        raise SystemExit(f"{APP}: '{new}' already exists")
+    data = load_layout(old)
+    data["name"] = new
+    write_json_atomic(layout_path(new), data)
+    os.unlink(layout_path(old))
+    if get_active() == old:
+        set_active(new)
+    print(f"renamed '{old}' -> '{new}'")
+    return 0
+
+
+def watch_pid():
+    try:
+        with open(PID_FILE, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_status(args):
+    cfg = load_config()
+    info = {
+        "active": get_active(),
+        "watch_pid": watch_pid(),
+        "boot": cfg["boot"],
+        "layouts": list_layouts(),
+        "restoring": lock_held(),
+    }
+    if "--json" in args:
+        print(json.dumps(info))
+    elif "--short" in args:
+        print(info["active"])
+    else:
+        print(f"active layout : {info['active']}")
+        print(f"watch daemon  : {'running (pid %d)' % info['watch_pid'] if info['watch_pid'] else 'not running'}")
+        print(f"boot mode     : {info['boot']}")
+        print(f"layouts       : {', '.join(info['layouts']) or '(none)'}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# watch daemon
+
+TRIGGER_EVENTS = {
+    "openwindow", "closewindow", "movewindow", "movewindowv2", "changefloatingmode",
+    "pin", "windowtitlev2", "fullscreen", "moveworkspacev2",
+}
+
+
+def cmd_watch(args):
+    cfg = load_config()
+    ensure_dirs()
+    existing = watch_pid()
+    if existing and "--replace" not in args:
+        log(f"already running (pid {existing})")
+        return 0
+    if existing:
+        try:
+            os.kill(existing, signal.SIGTERM)
+            time.sleep(0.5)
+        except OSError:
+            pass
+    hypr = Hypr()
+    path = hypr.socket2_path()
+    if not path or not os.path.exists(path):
+        raise SystemExit(f"{APP}: Hyprland event socket not found (not inside a Hyprland session?)")
+    with open(PID_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+    stop = {"flag": False}
+
+    def on_signal(signum, frame):
+        # Compositor teardown: stop without saving, keep the last good file.
+        stop["flag"] = True
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+
+    debounce = float(cfg["autosave_seconds"])
+    periodic = float(cfg["periodic_seconds"])
+    dirty = False
+    last_event = 0.0
+    last_save = time.time()
+    closes = []
+    teardown_until = 0.0
+    once = "--once" in args  # test hook: exit after first save
+
+    def do_save(reason):
+        nonlocal last_save, dirty
+        if lock_held():
+            return
+        name = get_active()
+        try:
+            snap = save_layout(name, hypr=hypr, cfg=cfg, quiet=True)
+        except SystemExit as e:
+            log(str(e))
+            snap = None
+        last_save = time.time()
+        dirty = False
+        if snap is not None:
+            with open(LOG_FILE, "a", encoding="utf-8") as lf:
+                lf.write(f"{now_iso()} saved {name} ({len(snap['windows'])} windows, {reason})\n")
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    sock.setblocking(False)
+    buf = b""
+    try:
+        while not stop["flag"]:
+            try:
+                ready, _, _ = select.select([sock], [], [], 1.0)
+            except InterruptedError:
+                ready = []
+            now = time.time()
+            if ready:
+                try:
+                    chunk = sock.recv(65536)
+                except BlockingIOError:
+                    chunk = b""
+                if not chunk:
+                    log("event socket closed")
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    ev, _, _data = line.decode("utf-8", "replace").partition(">>")
+                    if ev == "closewindow":
+                        closes.append(now)
+                        closes[:] = [t for t in closes if now - t <= 2.0]
+                        if len(closes) >= 3:
+                            # Burst of closes = logout/shutdown tearing windows
+                            # down. Do not record that as the layout.
+                            teardown_until = now + 30.0
+                    if ev in TRIGGER_EVENTS:
+                        dirty = True
+                        last_event = now
+            if stop["flag"] or now < teardown_until:
+                continue
+            if dirty and now - last_event >= debounce:
+                do_save("event")
+                if once:
+                    break
+            elif now - last_save >= periodic:
+                do_save("periodic")
+                if once:
+                    break
+    finally:
+        sock.close()
+        try:
+            if watch_pid() == os.getpid():
+                os.unlink(PID_FILE)
+        except OSError:
+            pass
+    return 0
+
+
+def start_watch_detached():
+    if watch_pid():
+        return
+    ensure_dirs()
+    with open(LOG_FILE, "a", encoding="utf-8") as lf:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "watch"],
+            stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True, close_fds=True,
+        )
+
+
+def cmd_boot(args):
+    cfg = load_config()
+    start_watch_detached()
+    if "--no-wait" not in args and not FAKE_DIR:
+        time.sleep(3)
+    layouts = list_layouts()
+    if not layouts:
+        return 0
+    if cfg["boot"] == "ask":
+        rows = []
+        for n in layouts:
+            data = read_json(layout_path(n), {}) or {}
+            rows.append(f"\t{n}\t{len(data.get('windows') or [])} windows")
+        rows.append("\tSkip\tstart with an empty desktop")
+        choice = menu_select("Restore layout", rows)
+        if not choice or choice.startswith("Skip"):
+            return 0
+        name = choice.split("\t", 1)[0]
+        set_active(name)
+    else:
+        name = get_active()
+        if name not in layouts:
+            return 0
+    summary = reconcile(load_layout(name), mode="keep", cfg=cfg)
+    notify("Layout restored", describe(summary, name))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# menu pickers (Omarchy shell)
+
+def menu_select(prompt, rows):
+    if FAKE_DIR:
+        return (read_json(os.path.join(FAKE_DIR, "menu.json"), {}) or {}).get("select")
+    try:
+        r = subprocess.run(["omarchy-menu-select", prompt, "--", "--width", "520"], input="\n".join(rows) + "\n", capture_output=True, text=True)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def menu_input(prompt):
+    if FAKE_DIR:
+        return (read_json(os.path.join(FAKE_DIR, "menu.json"), {}) or {}).get("input")
+    try:
+        r = subprocess.run(["omarchy-menu-input", prompt, "--width", "420"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def cmd_menu(args):
+    what = args[0] if args else "switch"
+    active = get_active()
+    if what == "switch":
+        rows = []
+        for n in list_layouts():
+            data = read_json(layout_path(n), {}) or {}
+            note = f"{len(data.get('windows') or [])} windows" + ("  ·  active" if n == active else "")
+            rows.append(f"{'󰄴' if n == active else '󰝦'}\t{n}\t{note}")
+        rows.append("\tNew layout…\tsave the current windows under a new name")
+        choice = menu_select("Switch layout", rows)
+        if not choice:
+            return 0
+        label = choice.split("\t", 1)[0]
+        if label.startswith("New layout"):
+            return cmd_menu(["save"])
+        return cmd_switch([label])
+    if what == "save":
+        name = menu_input("Layout name")
+        if not name:
+            return 0
+        if not valid_name(name):
+            notify("Invalid layout name", name)
+            return 1
+        save_layout(name, quiet=True)
+        set_active(name)
+        notify(f"Saved layout '{name}'", "It is now the active layout; autosave keeps it current.")
+        return 0
+    if what == "delete":
+        rows = [f"󰆴\t{n}" for n in list_layouts() if n != active]
+        if not rows:
+            notify("Nothing to delete", "Only the active layout exists.")
+            return 0
+        choice = menu_select("Delete layout", rows)
+        if not choice:
+            return 0
+        return cmd_delete([choice.split("\t", 1)[0]])
+    if what == "boot-mode":
+        cfg = load_config()
+        rows = [
+            f"{'󰄴' if cfg['boot'] == 'auto' else '󰝦'}\tauto\trestore the last active layout after login",
+            f"{'󰄴' if cfg['boot'] == 'ask' else '󰝦'}\task\tshow the layout picker after login",
+        ]
+        choice = menu_select("At login", rows)
+        if not choice:
+            return 0
+        cfg["boot"] = choice.split("\t", 1)[0]
+        save_config(cfg)
+        notify("Boot mode", f"Layout swapper will {'restore automatically' if cfg['boot'] == 'auto' else 'ask which layout to restore'} at login.")
+        return 0
+    raise SystemExit("usage: omarchy-layout-swapper menu switch|save|delete|boot-mode")
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if not args:
+        print(json.dumps(cfg, indent=2))
+        return 0
+    key = args[0]
+    if len(args) == 1:
+        print(json.dumps(cfg.get(key)))
+        return 0
+    val = args[1]
+    if key not in DEFAULT_CONFIG:
+        raise SystemExit(f"{APP}: unknown config key '{key}'")
+    if isinstance(DEFAULT_CONFIG[key], int):
+        val = int(val)
+    elif isinstance(DEFAULT_CONFIG[key], list):
+        val = [v for v in val.split(",") if v]
+    if key == "boot" and val not in ("auto", "ask"):
+        raise SystemExit(f"{APP}: boot must be 'auto' or 'ask'")
+    cfg[key] = val
+    save_config(cfg)
+    return 0
+
+
+USAGE = """usage: omarchy-layout-swapper <command> [args]
+
+  save [name] [--force]            snapshot the current windows into <name> (default: active)
+  switch <name>                    save the active layout, park its windows, bring up <name>
+  restore [name] [--keep|--close]  reconcile <name> onto the current desktop (default: active)
+          [--from-backup [N]]      ... from the Nth most recent autosave backup
+  list | show [name] [--json]      inspect layouts
+  delete <name> | rename <a> <b>   manage layouts
+  watch [--replace]                autosave daemon (Hyprland IPC events, debounced)
+  boot                             start the daemon, then restore or ask (config: boot)
+  menu switch|save|delete|boot-mode   Omarchy menu pickers
+  status [--json|--short]          active layout, daemon, boot mode
+  config [key [value]]             show or set configuration
+"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd, args = argv[0], argv[1:]
+    table = {
+        "save": cmd_save, "switch": cmd_switch, "restore": cmd_restore, "list": cmd_list,
+        "show": cmd_show, "delete": cmd_delete, "rename": cmd_rename, "watch": cmd_watch,
+        "boot": cmd_boot, "menu": cmd_menu, "status": cmd_status, "config": cmd_config,
+    }
+    fn = table.get(cmd)
+    if not fn:
+        sys.stderr.write(USAGE)
+        return 2
+    return fn(args) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
