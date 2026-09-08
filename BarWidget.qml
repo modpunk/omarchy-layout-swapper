@@ -4,12 +4,17 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Bar chip for the Layout Swapper: shows the active layout name and opens
-// the layout pickers. Everything that touches windows lives in
+// Bar chip for the Layout Swapper: a single icon whose tooltip names the
+// active layout. Everything that touches windows lives in
 // bin/omarchy-layout-swapper; this widget only reads one small state file
-// (the active layout name) and shells out fixed command strings through
-// bar.run (`bash -lc <command>`), so nothing parsed from disk reaches the
-// shell process as code.
+// (the active layout name, for the tooltip) and shells out fixed command
+// strings through bar.run (`bash -lc <command>`), so nothing parsed from
+// disk reaches the shell process as code.
+//
+// BarIconButton is a fixed one-slot-wide icon, so the visible mark and the
+// clickable area must be a single glyph — the layout name goes in the
+// tooltip, not the label (a multi-word label overflows the slot and leaves
+// most of the chip unclickable).
 //
 //   left click    switch layout (picker; "New layout…" saves the current one)
 //   right click   save the current windows as a new layout
@@ -18,6 +23,9 @@ BarWidget {
   id: root
   moduleName: "fans.omarchy.layout-swapper"
 
+  // Let the bar summon the switcher by plugin id (open/close/opened is the
+  // Bar.findPanelWidget contract). There is no in-shell panel, so opened
+  // stays false and open() just runs the picker.
   property bool opened: false
   function open() { root.run("menu switch") }
   function close() { opened = false }
@@ -54,7 +62,7 @@ BarWidget {
   }
 
   // The state file is replaced atomically (write + rename), which can drop a
-  // filesystem watch; a slow poll keeps the label honest.
+  // filesystem watch; a slow poll keeps the tooltip honest.
   Timer {
     interval: 5000
     running: true
@@ -66,10 +74,9 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰕰 " + root.activeName        // nf-md-view_dashboard + layout name
-    slotSize: Style.bar.statusSlot
-    fontSize: Style.font.caption
-    tooltipText: "Layout · " + root.activeName + "  (click: switch, right: save new, middle: login mode)"
+    text: "󰕰"                            // nf-md-view_dashboard
+    slotSize: Style.bar.iconSlot
+    tooltipText: "Layout · " + root.activeName + "\nclick: switch · right: save new · middle: login mode"
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.run("menu save")
