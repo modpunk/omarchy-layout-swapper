@@ -41,13 +41,46 @@ omarchy bar put fans.omarchy.layout-swapper
 
 `uninstall.sh` reverses 1–5 (`--purge` also deletes saved layouts).
 
-## Use
+## Everyday use
 
-| where | what |
+There is always one **active layout** (it starts as `main`). The autosave
+daemon keeps the active layout current for you as you open, move, and close
+windows, so you never have to save by hand. The bar chip's tooltip names the
+active layout.
+
+Three ways in:
+
+| where | what it does |
 |---|---|
-| bar chip `󰕰 main` | click: switch · right-click: save current as new layout · middle-click: login mode |
-| `SUPER + ALT + L` | switch layout (the picker's last row saves the current windows as a new layout) |
-| Omarchy menu → Layouts | switch, save as, save now, restore, login mode, delete, show |
+| bar chip `󰕰` | **click** switch layout · **right-click** save the current windows as a new layout · **middle-click** set login behaviour |
+| `SUPER + ALT + L` | open the layout switcher |
+| Omarchy menu → **Layouts** | switch, save as, save now, restore, login mode, delete, show |
+
+**Switching layouts.** Pick another layout from the switcher. The tool first
+saves where you are, then *parks* that layout's windows on a hidden workspace
+(they are not closed), and brings the chosen layout up. Switch back and your
+parked windows return exactly where they were, contents intact. So switching
+never loses anything you had open.
+
+**Creating a layout.** The switcher's last row, **New layout…**, and
+right-clicking the bar chip both capture your current windows under a new
+name and make that the active layout. Your previous layout keeps its own
+autosaved copy, so nothing is lost. From there, rearrange and open apps as you
+like; autosave records it into the new layout.
+
+**At login.** By default the last active layout comes back automatically a few
+seconds after you log in. Middle-click the bar chip (or the menu's *login
+mode*) to switch to being asked which layout to restore instead.
+
+**Recovering.** Every autosave keeps the last five snapshots per layout, so if
+a layout ends up wrong you can roll back:
+
+```
+omarchy-layout-swapper restore --from-backup        # most recent snapshot
+omarchy-layout-swapper restore <name> --from-backup 2   # the 2nd most recent
+```
+
+### Command line
 
 ```
 omarchy-layout-swapper save [name]              snapshot now (default: active layout)
@@ -62,6 +95,23 @@ omarchy-layout-swapper status
 Layouts are plain JSON under `~/.config/omarchy-layout-swapper/layouts/`;
 autosave backups (last 5 per layout) under
 `~/.local/state/omarchy-layout-swapper/backups/`.
+
+## Updating
+
+Layout Swapper is a git-managed Omarchy plugin, so you pull new versions with
+Omarchy's own command:
+
+```bash
+omarchy plugin update fans.omarchy.layout-swapper   # just this plugin
+omarchy plugin update                               # every git-managed plugin
+```
+
+That fetches the latest commit, shows you the diff, fast-forwards your copy,
+re-validates the manifest, and reloads the shell. **Updates are not automatic
+and nothing notifies you when a new version lands** — Omarchy's "update
+available" bar indicator tracks the system, not plugins. Run the command above
+now and then, or watch the repo on GitHub. After updating, restart the shell
+once (`omarchy restart shell`) if the bar chip does not refresh on its own.
 
 ## How it works
 
