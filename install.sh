@@ -21,11 +21,14 @@ ask() { (( YES )) && return 0; read -rp "$1 [y/N] " a; [[ $a == [yY]* ]]; }
 
 chmod +x "$BIN" "$REPO/hooks/layout-swapper" 2>/dev/null || true
 
-# 1. CLI on PATH
+# 1. CLI on PATH. Later steps reference the symlink when it exists, so the
+#    plugin folder can move (or be updated) without touching the configs.
+LINK="$HOME/.local/bin/omarchy-layout-swapper"
 if ask "Symlink omarchy-layout-swapper into ~/.local/bin?"; then
-  mkdir -p "$HOME/.local/bin"; ln -sfn "$BIN" "$HOME/.local/bin/omarchy-layout-swapper"
-  echo "  linked ~/.local/bin/omarchy-layout-swapper"
+  mkdir -p "$HOME/.local/bin"; ln -sfn "$BIN" "$LINK"
+  echo "  linked $LINK"
 fi
+CMD="$BIN"; [[ -x $LINK ]] && CMD="$LINK"
 
 # 2. Keybinding
 B="$HOME/.config/hypr/bindings.lua"
@@ -36,7 +39,7 @@ elif ask "Add keybinding SUPER + ALT + L -> Layout switcher to $B?"; then
   cat >>"$B" <<LUA
 
 -- Layout Swapper ($MARK). SUPER + ALT + L was unbound by default.
-o.bind("SUPER + ALT + L", "Layout switcher", "$BIN menu switch")
+o.bind("SUPER + ALT + L", "Layout switcher", "$CMD menu switch")
 LUA
   echo "  appended; run 'hyprctl reload && hyprctl configerrors' to verify"
 fi
@@ -79,14 +82,13 @@ fi
 
 # 5. Post-boot hook (restores the last layout after login)
 H="$HOME/.config/omarchy/hooks/post-boot.d/layout-swapper"
-if [[ -f $H ]] && grep -q "$BIN" "$H"; then
+if [[ -f $H ]] && grep -qF "BIN=\"$CMD\"" "$H"; then
   echo "  post-boot hook already installed at $H"
 elif ask "Install the post-boot hook so the last layout comes back after login ($H)?"; then
-  tmp=$(mktemp -t layout-swapper.XXXXXX)
-  sed "s|@BIN@|$BIN|" "$REPO/hooks/layout-swapper" >"$tmp"
-  mv "$tmp" "$tmp.hook"; cp "$tmp.hook" "$(dirname "$tmp")/layout-swapper"
-  omarchy-hook-install post-boot "$(dirname "$tmp")/layout-swapper" >/dev/null
-  rm -f "$tmp.hook" "$(dirname "$tmp")/layout-swapper"
+  d=$(mktemp -d)
+  sed "s|@BIN@|$CMD|" "$REPO/hooks/layout-swapper" >"$d/layout-swapper"
+  omarchy-hook-install post-boot "$d/layout-swapper" >/dev/null
+  rm -rf "$d"
   echo "  installed $H"
 fi
 
@@ -131,4 +133,4 @@ if ask "Take the first snapshot of the current windows and start the autosave da
     echo "  not inside a Hyprland session; the daemon starts from the post-boot hook at next login"
   fi
 fi
-echo "Done. Enable the bar chip with: omarchy bar add $MARK"
+echo "Done. Enable the bar chip with: omarchy bar put $MARK"

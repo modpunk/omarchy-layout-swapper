@@ -26,7 +26,7 @@ can do that.
 ```bash
 omarchy plugin add https://github.com/modpunk/omarchy-layout-swapper
 ~/.config/omarchy/plugins/fans.omarchy.layout-swapper/install.sh
-omarchy bar add fans.omarchy.layout-swapper
+omarchy bar put fans.omarchy.layout-swapper
 ```
 
 `install.sh` asks before each step and backs up any file it appends to:

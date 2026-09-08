@@ -55,4 +55,4 @@ if [[ ${1:-} == --purge ]]; then
   rm -rf "$HOME/.config/omarchy-layout-swapper" "$STATE"
   echo "  removed saved layouts and state"
 fi
-echo "Done. Remove the bar chip with: omarchy bar remove $MARK"
+echo "Done. Remove the bar chip with: omarchy bar reset (or edit ~/.config/omarchy/shell.json)"
