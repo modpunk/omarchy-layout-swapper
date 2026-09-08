@@ -33,11 +33,11 @@ BarWidget {
   // The CLI is on PATH once install.sh has symlinked it; fall back to the
   // copy inside this plugin folder so the widget works right after
   // `omarchy plugin add`.
-  readonly property string cli: "if command -v omarchy-layout-swapper >/dev/null 2>&1; then omarchy-layout-swapper; else '" + pluginBin + "'; fi"
+  readonly property string cli: "$(if command -v omarchy-layout-swapper >/dev/null 2>&1; then echo omarchy-layout-swapper; else echo '" + pluginBin + "'; fi)"
 
   function run(args) {
     if (root.bar && typeof root.bar.run === "function")
-      root.bar.run("$(" + cli + ") " + args)
+      root.bar.run(cli + " " + args)
   }
 
   readonly property string activeName: {
