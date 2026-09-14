@@ -13,11 +13,14 @@ if [[ -f $STATE/watch.pid ]]; then
   kill "$(cat "$STATE/watch.pid")" 2>/dev/null && echo "  stopped autosave daemon" || true
 fi
 
-# Turn off the opt-in update-check timer and remove its unit files.
-if [[ -x "$HOME/.local/bin/omarchy-layout-swapper" ]]; then
-  "$HOME/.local/bin/omarchy-layout-swapper" update-notify off >/dev/null 2>&1 || true
-elif [[ -x $BIN ]]; then
-  "$BIN" update-notify off >/dev/null 2>&1 || true
+# Clean up the update-check cache, and the systemd --user timer that older
+# versions (before the in-app update alert) installed, if it is still present.
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-layout-swapper" 2>/dev/null || true
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user disable --now omarchy-layout-swapper-update.timer >/dev/null 2>&1 || true
+  UD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  rm -f "$UD/omarchy-layout-swapper-update.timer" "$UD/omarchy-layout-swapper-update.service" 2>/dev/null || true
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
 
 L="$HOME/.local/bin/omarchy-layout-swapper"

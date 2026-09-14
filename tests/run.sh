@@ -320,36 +320,30 @@ grep -q 'window.move({ window = "address:0xZ", workspace = "4", follow = false }
 [[ ! -f "$T/config/layouts/keeper2.json" && ! -f "$T/state/parked/keeper2.json" ]] || tfail "delete cleanup incomplete"
 pass "delete/rename park-manifest handling"
 
-echo "== update notifications: opt-in gate, changelog, dedup"
-export LAYOUT_SWAPPER_NO_SYSTEMD=1
-GA=(-c user.email=t@t -c user.name=t -c init.defaultBranch=main -c commit.gpgsign=false)
-UP="$T/upstream"
-git "${GA[@]}" init -q -b main "$UP"
-( cd "$UP" && echo v1 >README.md && git "${GA[@]}" add -A && git "${GA[@]}" commit -q -m "initial release" )
-PLUG="$T/plugin"
-git "${GA[@]}" clone -q "$UP" "$PLUG" 2>/dev/null
-export LAYOUT_SWAPPER_PLUGIN_DIR="$PLUG"
-( cd "$UP" && echo x >>README.md && git "${GA[@]}" commit -qam "fix: stop parking the wrong window on switch" \
-  && echo y >>README.md && git "${GA[@]}" commit -qam "feat: restore tmux terminals by re-attaching" )
-
-[[ $("$L" update-check --print) == "" ]] || tfail "update-check ran while opted out"
-[[ $("$L" update-notify status) == off ]] || tfail "default update_check not off"
-
-"$L" update-notify on >/dev/null
-[[ $("$L" update-notify status) == on ]] || tfail "opt-in did not set on"
-out=$("$L" update-check --print)
-grep -q "update available (2 changes)" <<<"$out" || tfail "count/title: $out"
-grep -q "feat: restore tmux terminals" <<<"$out" || tfail "feature subject missing"
-grep -q "fix: stop parking the wrong window" <<<"$out" || tfail "fix subject missing"
-grep -q "omarchy plugin update" <<<"$out" || tfail "update command missing"
-
-[[ $("$L" update-check --print) == "" ]] || tfail "re-notified the same version"
-grep -q "update available" <<<"$("$L" update-check --print --force)" || tfail "--force did not re-report"
-
-"$L" update-notify off >/dev/null
-[[ $("$L" update-notify status) == off ]] || tfail "opt-out did not set off"
-[[ $("$L" update-check --print) == "" ]] || tfail "check ran after opt-out"
-unset LAYOUT_SWAPPER_PLUGIN_DIR LAYOUT_SWAPPER_NO_SYSTEMD
-pass "update notifications"
+echo "== update alert: the shared lib/update.sh check against file:// fixtures (docs/update-alerts.md)"
+j() { jq -r "$1" <<<"$2"; }
+R="$T/raw"; mkdir -p "$R"
+export OMARCHY_PLUGIN_UPDATE_RAW="file://$R" XDG_CACHE_HOME="$T/cache" XDG_CONFIG_HOME="$T/xdgcfg"
+jq '.version = "9.9.9"' "$ROOT/manifest.json" >"$R/manifest.json"
+printf '# Changelog\n\n## 9.9.9\n\n- Newest thing\n\n## 9.9.8\n\n- Older thing\n\n## 0.1.0\n\n- Ancient\n' >"$R/CHANGELOG.md"
+out=$("$L" update-check 0.1.0) || tfail "update-check exited $?"
+[[ $(j .latest "$out") == 9.9.9 && $(j .update_available "$out") == true && $(j '.notes|join(",")' "$out") == "Newest thing,Older thing" ]] || tfail "update-check: $out"
+[[ $(j .panel "$out") == 0.1.0 && $(j .cli "$out") == "$(jq -r .version "$ROOT/manifest.json")" && $(j .mismatch "$out") == true ]] || tfail "older widget is a mismatch: $out"
+out=$("$L" update-check); [[ $(j .mismatch "$out") == false && $(j .update_available "$out") == true ]] || tfail "same version, no mismatch: $out"
+[[ -f $T/cache/omarchy-layout-swapper/update-check.json ]] || tfail "no cache written"
+out=$(OMARCHY_PLUGIN_UPDATE_RAW=file:///nonexistent "$L" update-check); [[ $(j .latest "$out") == 9.9.9 ]] || tfail "offline answer from cache: $out"
+"$L" update-dismiss 9.9.9 || tfail "update-dismiss"
+[[ $("$L" update-check | jq -r .dismissed) == 9.9.9 ]] || tfail "dismissed not recorded"
+jq '.version = "0.0.1"' "$ROOT/manifest.json" >"$R/manifest.json"
+out=$("$L" update-check --force); [[ $(j .update_available "$out") == false && $(j '.notes|length' "$out") == 0 ]] || tfail "nothing newer: $out"
+mkdir -p "$XDG_CONFIG_HOME/omarchy-layout-swapper"; echo '{"update_check": false}' >"$XDG_CONFIG_HOME/omarchy-layout-swapper/config.json"
+out=$("$L" update-check --force); [[ $(j .enabled "$out") == false && $(j .latest "$out") == null ]] || tfail "opt-out: $out"
+rm "$XDG_CONFIG_HOME/omarchy-layout-swapper/config.json"
+out=$(OMARCHY_PLUGIN_UPDATE_PRINT=1 "$L" update-run all); [[ $(j '.argv[0]' "$out") == *omarchy-launch-tui && $(j '.argv[-1]' "$out") == all ]] || tfail "update-run argv: $out"
+! "$L" update-run bogus 2>/dev/null || tfail "update-run rejects unknown steps"
+echo 'not json' >"$T/cache/omarchy-layout-swapper/update-check.json"
+"$L" update-dismiss 1.2.3 && [[ $("$L" update-check --force | jq -r .dismissed) == 1.2.3 ]] || tfail "a broken cache file is replaced, not kept"
+unset OMARCHY_PLUGIN_UPDATE_RAW XDG_CACHE_HOME XDG_CONFIG_HOME
+pass "check, notes, cache, offline, dismiss, opt-out, run, broken cache"
 
 echo "All tests passed."

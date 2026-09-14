@@ -131,24 +131,27 @@ bar indicator tracks the system, not plugins, so it will not tell you a new
 version of this plugin exists. After updating, restart the shell once
 (`omarchy restart shell`) if the bar chip does not refresh on its own.
 
-### Update notifications (opt-in)
+### Update alerts
 
-If you want to be told when a new version is out, turn on update notifications:
+The bar chip tells you when a newer version is published, so you do not have to
+run `omarchy plugin update` on a hunch. When one is out, a small dot appears on
+the `󰕰` icon; the next click opens a popup listing what changed (from this
+plugin's `CHANGELOG.md`) with an **Update…** button that opens a terminal and
+runs `omarchy plugin update` for you (it shows the diff and asks first).
+**Later** hides that version until the next one.
+
+The check is one small request to the plugin's repository on load and every six
+hours, cached in `~/.cache/omarchy-layout-swapper/`; offline it uses the last
+answer. It sends no personal data — only a User-Agent naming the plugin. It is
+**on by default**; turn it off with:
 
 ```bash
-omarchy-layout-swapper update-notify on     # or the menu: Layouts → Notify me about updates
+omarchy-layout-swapper config update_check false     # `true` to turn back on
 ```
 
-This is **off by default**. When on, a `systemd --user` timer checks the
-plugin's git remote a few minutes **after** you log in — in the background, so
-it never sits on the boot path — and at most once a day after that. If a newer
-version exists, you get one desktop notification listing what changed (the
-commit messages between your version and the latest) and the
-`omarchy plugin update` command to apply it. It notifies once per new version,
-never auto-updates, and stays quiet when you are offline. Turn it off again
-with `omarchy-layout-swapper update-notify off` (or the same menu toggle),
-which also removes the timer. So keep your commit messages descriptive — they
-are the changelog your users see.
+(or set `"update_check": false` in the widget's `shell.json` entry). See
+[docs/update-alerts.md](docs/update-alerts.md) for the full design. So keep the
+`CHANGELOG.md` bullets descriptive — they are what your users read in the popup.
 
 ## How it works
 
