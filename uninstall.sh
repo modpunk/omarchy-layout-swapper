@@ -4,8 +4,6 @@
 # and the post-boot hook. Saved layouts under ~/.config/omarchy-layout-swapper
 # are kept unless --purge is given. Chromium's startup setting is left alone.
 set -euo pipefail
-REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$REPO/bin/omarchy-layout-swapper"
 MARK="fans.omarchy.layout-swapper"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-layout-swapper"
 
