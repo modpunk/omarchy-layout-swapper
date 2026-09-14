@@ -80,7 +80,7 @@ echo "== save: launch derivation"
 "$L" save main >/dev/null || tfail "save exited non-zero"
 J="$T/config/layouts/main.json"
 [[ -f $J ]] || tfail "layout file missing"
-n=$(jq '.windows|length' "$J"); [[ $n == 11 ]] || tfail "expected 11 windows (menu, parked, agent, scratchpad excluded), got $n"
+n=$(jq '.windows|length' "$J"); [[ $n == 12 ]] || tfail "expected 12 windows (menu, parked, scratchpad excluded; agent now captured), got $n"
 kind() { jq -r --arg c "$1" '.windows[]|select(.class==$c)|.launch.kind' "$J" | head -1; }
 cmd() { jq -r --arg c "$1" '.windows[]|select(.class==$c)|.launch.cmd' "$J" | head -1; }
 [[ $(kind chrome-x.com__-Profile_1) == webapp ]] || tfail "webapp kind"
@@ -97,30 +97,32 @@ idle=$(jq -r '.windows[]|select(.class=="foot" and .title=="zsh")|.launch.cmd' "
 [[ $(kind Aether) == native && $(cmd Aether) == "/usr/bin/aether" ]] || tfail "native: $(cmd Aether)"
 [[ $(jq -r '.windows[]|select(.class=="Aether")|.launch.cwd' "$J") == /home/u ]] || tfail "native cwd"
 [[ $(cmd org.gnome.Nautilus) == "/usr/bin/nautilus --new-window" ]] || tfail "nautilus"
-[[ $(jq '[.windows[]|select(.class=="org.omarchy.agent")]|length' "$J") == 0 ]] || tfail "agent window should be excluded from layouts"
+# Agent terminals are now captured (position/command only). The top-bar pop-up is
+# a layer surface, never a client, so there is nothing to filter for it.
+[[ $(jq '[.windows[]|select(.class=="org.omarchy.agent")]|length' "$J") == 1 ]] || tfail "agent terminal should be captured in layouts"
+[[ $(kind org.omarchy.agent) == agent ]] || tfail "agent kind"
+[[ $(cmd org.omarchy.agent) == "xdg-terminal-exec --app-id=org.omarchy.agent --dir=/home/u/Work -e /home/u/.local/share/mise/installs/claude/latest/claude --permission-mode auto" ]] || tfail "agent cmd: $(cmd org.omarchy.agent)"
 [[ $(jq '[.windows[]|select(.workspace|startswith("special:"))]|length' "$J") == 0 ]] || tfail "special-workspace windows (scratchpad) should be excluded"
 [[ $(jq -r '.windows[]|select(.title=="nvim notes.md")|[.floating,.pinned,.size[0]]|@csv' "$J") == "true,true,800" ]] || tfail "float/pin/size"
 [[ $(jq -r '.windows[]|select(.title=="zsh")|.fullscreen' "$J") == 2 ]] || tfail "fullscreen int"
 [[ $(jq -r '.active_workspace' "$J") == 3 && $(jq -r '.monitors[0]' "$J") == eDP-1 ]] || tfail "meta"
 [[ $(cat "$T/state/active") == main ]] || tfail "active set"
-pass "11 records; agent and special-workspace windows excluded"
+pass "12 records; agent captured, special-workspace windows excluded"
 
-echo "== agent-window derivation still works when the class is not ignored"
+echo "== agent windows can still be opted out via ignore_classes"
 (
-  export LAYOUT_SWAPPER_CONFIG_DIR="$T/cfg-agent" LAYOUT_SWAPPER_STATE_DIR="$T/st-agent"
-  "$L" config ignore_classes org.omarchy.menu >/dev/null
-  "$L" save ag >/dev/null
-  JA="$T/cfg-agent/layouts/ag.json"
-  [[ $(jq -r '.windows[]|select(.class=="org.omarchy.agent")|.launch.kind' "$JA") == agent ]] || tfail "agent kind"
-  [[ $(jq -r '.windows[]|select(.class=="org.omarchy.agent")|.launch.cmd' "$JA") == "xdg-terminal-exec --app-id=org.omarchy.agent --dir=/home/u/Work -e /home/u/.local/share/mise/installs/claude/latest/claude --permission-mode auto" ]] || tfail "agent cmd"
-  [[ $(jq '[.windows[]|select(.workspace|startswith("special:"))]|length' "$JA") == 0 ]] || tfail "special still excluded (hardcoded)"
+  export LAYOUT_SWAPPER_CONFIG_DIR="$T/cfg-noagent" LAYOUT_SWAPPER_STATE_DIR="$T/st-noagent"
+  "$L" config ignore_classes org.omarchy.menu,org.omarchy.agent >/dev/null
+  "$L" save na >/dev/null
+  JN="$T/cfg-noagent/layouts/na.json"
+  [[ $(jq '[.windows[]|select(.class=="org.omarchy.agent")]|length' "$JN") == 0 ]] || tfail "agent not excluded when added to ignore_classes"
 )
-pass "agent derivation intact; special always excluded"
+pass "agent opt-out via config works"
 
 echo "== save: empty snapshot refused, --force allowed"
 cp "$T/fake/clients.json" "$T/clients.full.json"; echo '[]' >"$T/fake/clients.json"
 if "$L" save main 2>/dev/null; then tfail "empty save should fail"; fi
-[[ $(jq '.windows|length' "$J") == 11 ]] || tfail "layout clobbered"
+[[ $(jq '.windows|length' "$J") == 12 ]] || tfail "layout clobbered"
 "$L" save main --force >/dev/null; [[ $(jq '.windows|length' "$J") == 0 ]] || tfail "--force"
 cp "$T/clients.full.json" "$T/fake/clients.json"; "$L" save main >/dev/null
 pass "refusal and --force"
@@ -147,7 +149,8 @@ pass "management commands"
 
 echo "== restore: claim existing, launch missing, place, chromium bootstrap"
 # Live desktop: X webapp (same stableId, moved to ws 9 by the user); an agent
-# window (must be left untouched); a stray kitty. Browser not running.
+# terminal (now claimed by class and placed on its saved workspace); a stray
+# kitty (extra, left alone in keep mode). Browser not running.
 {
   mkwin 0x1 chrome-x.com__-Profile_1 "Home / X" 9 15035 s1 '[12,38]' '[1256,750]' false false 0
   mkwin 0x77 org.omarchy.agent "other title" 7 19285 zz '[12,38]' '[1256,750]' false false 0
@@ -159,7 +162,7 @@ D="$T/fake/dispatch.log"
 grep -q 'hl.dsp.exec_cmd(\[\[chromium --profile-directory=.Profile 1.\]\])' "$D" || tfail "browser bootstrap for Profile 1 missing"
 grep -q 'exec_cmd(\[\[chromium --profile-directory=Default\]\])' "$D" || tfail "browser bootstrap for Default missing"
 grep -q 'window.move({ window = "address:0x1", workspace = "1", follow = false })' "$D" || tfail "claimed X window moved back to ws 1"
-grep -q 'address:0x77' "$D" && tfail "agent window must be left untouched by restore"
+grep -q 'window.move({ window = "address:0x77", workspace = "3", follow = false })' "$D" || tfail "agent terminal claimed and placed on its saved workspace"
 grep -q 'exec_cmd(\[\[uwsm-app -- xdg-terminal-exec --app-id=Alacritty' "$D" || tfail "tmux terminal launched"
 grep -q 'exec_cmd(\[\[uwsm-app -- cd /home/u && /usr/bin/aether\]\], { workspace = "2 silent" })' "$D" || tfail "native launched with cwd: $(grep aether "$D" || true)"
 grep -q 'exec_cmd(\[\[uwsm-app -- xdg-terminal-exec --app-id=foot --dir=/home/u/Work/tries -e bash -c .nvim notes.md; exec bash.\]\], { workspace = "3 silent", float = true, size = {800, 500}, move = {100, 100} })' "$D" || tfail "float exec rules"
@@ -168,19 +171,37 @@ grep -q 'hl.dsp.focus({ workspace = "3" })' "$D" || tfail "focus restored"
 grep -q "missing" "$T/restore.out" || tfail "summary should report unlaunchable/unmatched windows (fake never opens them)"
 pass "reconcile dispatches"
 
-echo "== switch: saves old, parks extras under special:ls-<old>, activates new"
+echo "== switch: frozen old layout untouched, session checkpointed, extras parked"
 cp "$T/clients.full.json" "$T/fake/clients.json"
 "$L" save work --no-activate >/dev/null
+mainbefore=$(jq '.windows|length' "$T/config/layouts/main.json")
+rm -f "$T/state/session.json"
 { mkwin 0x50 Aether Aether 2 44721 s11 '[12,38]' '[621,750]' false false 0
   mkwin 0x51 kitty extra 5 32000 q1 '[12,38]' '[621,750]' false false 0; } | jq -s . >"$T/fake/clients.json"
 rm -f "$D"; touch "$T/fake/browser-running"
 "$L" switch work >"$T/switch.out" 2>&1 || { cat "$T/switch.out"; tfail "switch exited non-zero"; }
 [[ $(cat "$T/state/active") == work ]] || tfail "active not switched"
-[[ $(jq '.windows|length' "$T/config/layouts/main.json") == 2 ]] || tfail "old layout not re-saved from live state"
+# Frozen snapshots: the layout we left must NOT be rewritten (this was the data-loss bug).
+[[ $(jq '.windows|length' "$T/config/layouts/main.json") == "$mainbefore" ]] || tfail "old named layout was clobbered on switch-away"
+# Instead the live desktop is checkpointed into the session file (2 live windows).
+[[ $(jq '.windows|length' "$T/state/session.json") == 2 ]] || tfail "session not checkpointed on switch"
 grep -q 'window.move({ window = "address:0x51", workspace = "special:ls-main", follow = false })' "$D" || tfail "extra not parked"
 grep -q 'window.move({ window = "address:0x50", workspace = "2", follow = false })' "$D" || tfail "aether claimed by stableId"
 grep -qE 'exec_cmd\(\[\[chromium --profile-directory=[^]]*\]\]\)$' "$D" && tfail "browser bootstrap while browser running"
-pass "switch/park"
+# A park manifest recorded the parked extra and where it came from.
+[[ $(jq -r '."0x51".workspace' "$T/state/parked/main.json") == 5 ]] || tfail "park manifest missing the parked window's origin workspace"
+pass "switch: old frozen, session checkpointed, park manifest written"
+
+echo "== unpark: switching to a layout returns windows it parked earlier, even unlisted ones"
+# The extra 0x51 was parked under 'main' above; 'main' does not list it. Switching
+# back to main must un-park it to its recorded workspace 5, not strand it.
+{ mkwin 0x50 Aether Aether 2 44721 s11 '[12,38]' '[621,750]' false false 0
+  mkwin 0x51 kitty extra "special:ls-main" 32000 q1 '[12,38]' '[621,750]' false false 0; } | jq -s . >"$T/fake/clients.json"
+rm -f "$D"
+"$L" switch main >"$T/unpark.out" 2>&1 || { cat "$T/unpark.out"; tfail "switch main exited non-zero"; }
+grep -q 'window.move({ window = "address:0x51", workspace = "5", follow = false })' "$D" || tfail "parked window not un-parked to its origin workspace"
+[[ ! -f "$T/state/parked/main.json" ]] || tfail "park manifest not consumed after un-park"
+pass "unpark restores unlisted parked windows"
 
 echo "== watch daemon: debounce save, teardown burst skipped, SIGTERM never saves"
 cp "$T/clients.full.json" "$T/fake/clients.json"
@@ -207,54 +228,97 @@ while time.time() < deadline:
     time.sleep(0.1)
 PY
 sleep 0.5
-"$L" save main >/dev/null   # also makes main the active layout again
-rm -f "$T/config/layouts/main.json"
+"$L" save main >/dev/null   # a named snapshot the daemon must NOT touch
+rm -f "$T/state/session.json"
+mainlen=$(jq '.windows|length' "$T/config/layouts/main.json")
 "$L" watch &
 WPID=$!
 sleep 1
 [[ $("$L" status --json | jq .watch_pid) == "$WPID" ]] || tfail "pidfile"
 echo "openwindow>>abc,3,foot,title, with comma" >"$T/ev.cmd"
 sleep 2.5
-[[ -f $T/config/layouts/main.json ]] || tfail "event did not trigger a save"
-grep -q 'saved main' "$T/state/watch.log" || tfail "watch log"
-rm -f "$T/config/layouts/main.json"
+[[ -f $T/state/session.json ]] || tfail "event did not trigger a session save"
+grep -q 'saved session' "$T/state/watch.log" || tfail "watch log"
+# The daemon must write the live session, never the named snapshot.
+[[ $(jq '.windows|length' "$T/config/layouts/main.json") == "$mainlen" ]] || tfail "daemon overwrote the named layout"
+rm -f "$T/state/session.json"
 printf 'closewindow>>1\ncloseWindow-2\nclosewindow>>2\nclosewindow>>3\nopenwindow>>x,1,foot,t\n' >"$T/ev.cmd"
 sleep 3
-[[ ! -f $T/config/layouts/main.json ]] || tfail "saved during teardown burst"
+[[ ! -f $T/state/session.json ]] || tfail "saved during teardown burst"
 pass "burst suppressed"
 # Restore lock pauses saves
 touch "$T/state/restore.lock"; echo "openwindow>>y,1,foot,t2" >>"$T/ev.cmd"; sleep 2.5
-[[ ! -f $T/config/layouts/main.json ]] || tfail "saved while restore lock held"
+[[ ! -f $T/state/session.json ]] || tfail "saved while restore lock held"
 rm -f "$T/state/restore.lock"
 echo "openwindow>>z,1,foot,t3" >>"$T/ev.cmd"
 kill -TERM "$WPID"; wait "$WPID" 2>/dev/null || true
-[[ ! -f $T/config/layouts/main.json ]] || tfail "SIGTERM path saved"
+[[ ! -f $T/state/session.json ]] || tfail "SIGTERM path saved"
 [[ ! -f $T/state/watch.pid ]] || tfail "pidfile not cleaned"
 echo quit >>"$T/ev.cmd"
 pass "watch daemon"
 
-echo "== boot: ask mode uses the picker, auto restores active"
-cp "$T/clients.full.json" "$T/fake/clients.json"; "$L" save main >/dev/null
+echo "== boot: auto restores the live session, falls back to named, ask uses the picker"
+cp "$T/clients.full.json" "$T/fake/clients.json"
+"$L" save main >/dev/null
+"$L" save work --no-activate >/dev/null
+
+# auto + a session present -> restores the session
+"$L" save >/dev/null   # bare save = session checkpoint
+"$L" config boot auto >/dev/null
+rm -f "$D"; "$L" boot --no-wait >/dev/null 2>&1 || true
+grep -q 'hl.dsp' "$D" || tfail "boot auto did not restore the session"
+kill "$(cat "$T/state/watch.pid" 2>/dev/null)" 2>/dev/null || true
+
+# auto + no session yet (fresh upgrade) -> falls back to the last-applied named layout
+rm -f "$T/state/session.json"; echo work >"$T/state/active"
+rm -f "$D"; "$L" boot --no-wait >/dev/null 2>&1 || true
+grep -q 'hl.dsp' "$D" || tfail "boot auto did not fall back to the named layout"
+kill "$(cat "$T/state/watch.pid" 2>/dev/null)" 2>/dev/null || true
+
+# ask mode -> the picker choice is applied
 "$L" config boot ask >/dev/null
+echo main >"$T/state/active"
 echo '{"select":"work\t12 windows"}' >"$T/fake/menu.json"
 rm -f "$D"; "$L" boot --no-wait >/dev/null 2>&1 || true
 [[ $(cat "$T/state/active") == work ]] || tfail "boot ask did not activate the choice"
+kill "$(cat "$T/state/watch.pid" 2>/dev/null)" 2>/dev/null || true
+
+# ask mode -> Skip leaves things alone
+echo work >"$T/state/active"
 echo '{"select":"Skip\tstart with an empty desktop"}' >"$T/fake/menu.json"
 "$L" boot --no-wait >/dev/null 2>&1 || true
 [[ $(cat "$T/state/active") == work ]] || tfail "skip changed active"
-"$L" config boot auto >/dev/null; rm -f "$D"; "$L" boot --no-wait >/dev/null 2>&1 || true
-grep -q 'hl.dsp' "$D" || tfail "boot auto did not reconcile"
 kill "$(cat "$T/state/watch.pid" 2>/dev/null)" 2>/dev/null || true
-pass "boot modes"
+"$L" config boot auto >/dev/null
+pass "boot modes (session, fallback, ask, skip)"
 
 echo "== menu pickers"
+cp "$T/clients.full.json" "$T/fake/clients.json"
 echo '{"input":"Focus Mode"}' >"$T/fake/menu.json"
 "$L" menu save >/dev/null; [[ -f "$T/config/layouts/Focus Mode.json" && $(cat "$T/state/active") == "Focus Mode" ]] || tfail "menu save"
 echo '{"input":"bad/name"}' >"$T/fake/menu.json"
 if "$L" menu save >/dev/null 2>&1; then tfail "invalid name accepted"; fi
+# save-now re-saves the last-applied snapshot in place, picking up new changes.
+jq '.[0].title="changed by save-now"' "$T/clients.full.json" >"$T/fake/clients.json"
+"$L" menu save-now >/dev/null
+[[ $(jq -r '[.windows[]|select(.title=="changed by save-now")]|length' "$T/config/layouts/Focus Mode.json") == 1 ]] || tfail "save-now did not update the last-applied snapshot"
+cp "$T/clients.full.json" "$T/fake/clients.json"
 echo '{"select":"main\t12 windows"}' >"$T/fake/menu.json"
 "$L" menu delete >/dev/null; [[ ! -f $T/config/layouts/main.json ]] || tfail "menu delete"
-pass "menu save/delete"
+pass "menu save/save-now/delete"
+
+echo "== delete and rename carry the park manifest (no stranded windows)"
+cp "$T/clients.full.json" "$T/fake/clients.json"
+"$L" save keeper --no-activate >/dev/null
+echo '{"0xZ":{"stable_id":"z","workspace":"4","at":[0,0],"size":[1,1],"floating":false,"fullscreen":0,"pinned":false}}' >"$T/state/parked/keeper.json"
+"$L" rename keeper keeper2 >/dev/null
+[[ -f "$T/state/parked/keeper2.json" && ! -f "$T/state/parked/keeper.json" ]] || tfail "rename did not carry the park manifest"
+{ mkwin 0xZ foot leftover "special:ls-keeper2" 32000 z '[0,0]' '[1,1]' false false 0; } | jq -s . >"$T/fake/clients.json"
+rm -f "$D"; echo main >"$T/state/active"
+"$L" delete keeper2 >/dev/null
+grep -q 'window.move({ window = "address:0xZ", workspace = "4", follow = false })' "$D" || tfail "delete did not un-park parked windows before removing the layout"
+[[ ! -f "$T/config/layouts/keeper2.json" && ! -f "$T/state/parked/keeper2.json" ]] || tfail "delete cleanup incomplete"
+pass "delete/rename park-manifest handling"
 
 echo "== update notifications: opt-in gate, changelog, dedup"
 export LAYOUT_SWAPPER_NO_SYSTEMD=1

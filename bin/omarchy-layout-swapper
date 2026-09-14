@@ -2,25 +2,26 @@
 # omarchy-layout-swapper — save, switch, and auto-restore Hyprland window
 # layouts on Omarchy.
 #
-#   omarchy-layout-swapper save [name] [--force]     snapshot the current layout
-#   omarchy-layout-swapper switch <name>             save current, park it, bring up <name>
+#   omarchy-layout-swapper save [name] [--force]     freeze a named snapshot (bare: checkpoint the live session)
+#   omarchy-layout-swapper switch <name>             checkpoint the session, park extras, bring up <name>
 #   omarchy-layout-swapper restore [name] [--keep|--close]
 #   omarchy-layout-swapper list | show [name] | delete <name> | rename <a> <b>
 #   omarchy-layout-swapper watch                     autosave daemon (Hyprland IPC events)
-#   omarchy-layout-swapper boot                      start watch, then auto-restore or ask
-#   omarchy-layout-swapper menu switch|save|delete|boot-mode
+#   omarchy-layout-swapper boot                      start watch, then restore the session or ask
+#   omarchy-layout-swapper menu switch|save|save-now|delete|boot-mode
 #   omarchy-layout-swapper status [--json|--short]
 #
 # Stdlib only. Hyprland >= 0.55 (Lua dispatchers), with legacy string
 # dispatchers as a fallback, the same idiom Omarchy's own scripts use.
 #
-# A layout is a JSON list of window records: class, workspace, geometry,
-# floating/pinned/fullscreen state, and a launch command derived at save time
-# (web apps from the desktop-file index, terminals from the child shell's cwd,
-# native apps from /proc). Restore is a reconcile: existing windows are
-# claimed and moved into place, missing ones are launched one at a time and
-# matched as they open, extras are kept, closed, or parked on a hidden
-# per-layout special workspace so switching back is instant.
+# Named layouts are FROZEN snapshots: JSON lists of window records (class,
+# workspace, geometry, floating/pinned/fullscreen, and a launch command derived
+# at save time) that change only on an explicit save. A separate live session
+# file is what the autosave daemon keeps current and what boot restores. Restore
+# is a reconcile: existing windows are claimed and moved into place, missing ones
+# are launched one at a time and matched as they open; on switch, extras are
+# parked on a hidden per-layout special workspace (with a manifest recording
+# where each came from) so switching back returns them exactly.
 
 import glob
 import json
@@ -51,7 +52,21 @@ STATE_DIR = os.environ.get(
 LAYOUTS_DIR = os.path.join(CONFIG_DIR, "layouts")
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+# The active file now records the *last-applied* named snapshot (for the bar chip
+# tooltip and the boot fallback) — it no longer redirects the autosave daemon.
 ACTIVE_FILE = os.path.join(STATE_DIR, "active")
+# The live session: named snapshots are frozen point-in-time files under
+# LAYOUTS_DIR, changed only by an explicit save; the autosave daemon writes the
+# live desktop here instead, and this is what boot restores. It lives in STATE
+# (never LAYOUTS), so it is invisible to `list` and cannot collide with a layout
+# name. SESSION_NAME starts with '_' so valid_name() rejects it — no user layout
+# can ever be named it, and its backups key never clashes with a real layout.
+SESSION_NAME = "__session__"
+SESSION_FILE = os.path.join(STATE_DIR, "session.json")
+# Per-name manifests recording what `switch` parked onto special:ls-<name> and
+# each window's pre-park workspace + geometry, so switching back can un-park
+# windows the frozen snapshot does not itself mention.
+PARK_DIR = os.path.join(STATE_DIR, "parked")
 PID_FILE = os.path.join(STATE_DIR, "watch.pid")
 LOCK_FILE = os.path.join(STATE_DIR, "restore.lock")
 LOG_FILE = os.path.join(STATE_DIR, "watch.log")
@@ -101,13 +116,15 @@ DEFAULT_CONFIG = {
     # Opt-in: notify a few minutes after login when a newer version is on the
     # plugin's git remote. Off until the user turns it on.
     "update_check": "off",
-    # Transient / shell windows never worth restoring. org.omarchy.agent is
-    # here because agent terminals (Omarchy agents, the Agent Launcher's Hermes
-    # sessions) are summoned on demand from the agent menu and keep running in
-    # tmux when their window is closed — layouts should never save, relaunch,
-    # or surface them. Remove it from this list if you want agents in layouts.
+    # Transient / shell windows never worth restoring. NOTE: org.omarchy.agent is
+    # deliberately NOT here. The agent *pop-up* summoned from the top bar is a
+    # Quickshell layer-shell surface, not a toplevel window, so it never appears
+    # in `hyprctl clients -j` and needs no filtering. The only org.omarchy.agent
+    # toplevels are real agent terminals (Claude Code, the Agent Launcher's tmux
+    # sessions) the user placed on a workspace — we save their position (a relaunch
+    # is a fresh agent; no conversation state is restored). Detached tmux agents
+    # have no window and so are naturally not captured.
     "ignore_classes": [
-        "org.omarchy.agent",
         "org.omarchy.menu",
         "org.omarchy.osd",
         "org.omarchy.shell",
@@ -154,8 +171,12 @@ def now_iso():
 
 
 def ensure_dirs():
-    for d in (CONFIG_DIR, LAYOUTS_DIR, STATE_DIR, BACKUP_DIR):
+    for d in (CONFIG_DIR, LAYOUTS_DIR, STATE_DIR, BACKUP_DIR, PARK_DIR):
         os.makedirs(d, exist_ok=True)
+
+
+def park_path(name):
+    return os.path.join(PARK_DIR, f"{name}.json")
 
 
 def read_json(path, default=None):
@@ -665,8 +686,8 @@ def ws_sort_key(name):
         return (1, name)
 
 
-def rotate_backups(name, cfg):
-    old = layout_path(name)
+def rotate_backups(name, cfg, src_path=None):
+    old = src_path or layout_path(name)
     if not os.path.exists(old):
         return
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -685,27 +706,37 @@ def rotate_backups(name, cfg):
             pass
 
 
-def save_layout(name, hypr=None, cfg=None, force=False, quiet=False):
+def save_layout(name, hypr=None, cfg=None, force=False, quiet=False, path=None):
     """Snapshot into <name>. Refuses to replace a non-empty layout with an
-    empty one (a compositor teardown looks exactly like that) unless forced."""
+    empty one (a compositor teardown looks exactly like that) unless forced.
+    When `path` is given the snapshot is written there (used for the live
+    session file); otherwise it goes to the named layout under LAYOUTS_DIR."""
     cfg = cfg or load_config()
     hypr = hypr or Hypr()
-    if not valid_name(name):
+    if path is None and not valid_name(name):
         raise SystemExit(f"{APP}: invalid layout name '{name}'")
     ensure_dirs()
     snap = snapshot(hypr, cfg)
     snap["name"] = name
-    existing = read_json(layout_path(name))
+    target = path or layout_path(name)
+    existing = read_json(target)
     if not snap["windows"] and existing and existing.get("windows") and not force:
         if not quiet:
             log(f"refusing to overwrite '{name}' ({len(existing['windows'])} windows) with an empty snapshot; use --force")
         return None
     if existing and existing.get("windows") != snap["windows"]:
-        rotate_backups(name, cfg)
-    write_json_atomic(layout_path(name), snap)
+        rotate_backups(name, cfg, src_path=target)
+    write_json_atomic(target, snap)
     if not quiet:
         print(f"saved '{name}': {len(snap['windows'])} windows")
     return snap
+
+
+def save_session(hypr=None, cfg=None, force=False, quiet=True):
+    """Checkpoint the live desktop into the reserved session file. This is what
+    the autosave daemon writes and what boot restores — named snapshots are
+    never touched by it."""
+    return save_layout(SESSION_NAME, hypr=hypr, cfg=cfg, force=force, quiet=quiet, path=SESSION_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -880,8 +911,59 @@ def wait_settle(hypr, quiet=2.0, maximum=20.0):
             return
 
 
-def reconcile(layout, mode="keep", park_as=None, hypr=None, cfg=None):
-    """Bring `layout` up. mode: keep | close | park (extras go to special:ls-<park_as>)."""
+def _norm_fullscreen(v):
+    if isinstance(v, bool):
+        return 2 if v else 0
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _unpark(name, hypr, used):
+    """Return windows parked under special:ls-<name> to the workspace/geometry the
+    manifest recorded for them, then drop the manifest. Windows already claimed
+    and placed this pass (in `used`) are skipped. This rescues windows that were
+    open when the user last left <name> but that <name>'s frozen snapshot does not
+    itself list, so switching back does not strand them on the hidden workspace."""
+    manifest = read_json(park_path(name)) or {}
+    if manifest:
+        clients = hypr.clients()
+        by_addr = {c.get("address"): c for c in clients}
+        by_sid = {}
+        for c in clients:
+            sid = c.get("stableId")
+            if sid:
+                by_sid.setdefault(sid, c)
+        for addr, info in manifest.items():
+            c = by_addr.get(addr) or by_sid.get(info.get("stable_id"))
+            if not c:
+                continue
+            caddr = c.get("address")
+            if not caddr or caddr in used:
+                continue
+            ws = info.get("workspace") or "1"
+            if str(ws).startswith("special:"):
+                continue
+            place_window(hypr, {
+                "workspace": ws,
+                "at": info.get("at") or [0, 0],
+                "size": info.get("size") or [0, 0],
+                "floating": info.get("floating", False),
+                "fullscreen": info.get("fullscreen", 0),
+                "pinned": info.get("pinned", False),
+            }, caddr)
+            used.add(caddr)
+    try:
+        os.unlink(park_path(name))
+    except OSError:
+        pass
+
+
+def reconcile(layout, mode="keep", park_as=None, hypr=None, cfg=None, unpark_name=None):
+    """Bring `layout` up. mode: keep | close | park (extras go to special:ls-<park_as>).
+    When `unpark_name` is set, windows previously parked under that name are
+    returned to their recorded places after extras are parked."""
     cfg = cfg or load_config()
     hypr = hypr or Hypr()
     # Never act on a member saved on a special workspace or one whose class is
@@ -940,6 +1022,7 @@ def reconcile(layout, mode="keep", park_as=None, hypr=None, cfg=None):
             place_window(hypr, records[i], addr)
 
         # Extras: live windows the layout does not mention.
+        parked = {}
         if mode in ("close", "park"):
             for c in hypr.clients():
                 addr = c.get("address")
@@ -951,10 +1034,33 @@ def reconcile(layout, mode="keep", park_as=None, hypr=None, cfg=None):
                     hypr.dispatch(f"hl.dsp.window.close({{ window = {a} }})", ["closewindow", f"address:{addr}"])
                 else:
                     ws = PARK_PREFIX + (park_as or "parked")
+                    # Record where the window was so switching back can restore it,
+                    # even if <park_as>'s frozen snapshot never listed it.
+                    parked[addr] = {
+                        "stable_id": c.get("stableId") or "",
+                        "workspace": (c.get("workspace") or {}).get("name") or "1",
+                        "at": list(c.get("at") or [0, 0]),
+                        "size": list(c.get("size") or [0, 0]),
+                        "floating": bool(c.get("floating", False)),
+                        "fullscreen": _norm_fullscreen(c.get("fullscreen", 0)),
+                        "pinned": bool(c.get("pinned", False)),
+                    }
                     hypr.dispatch(
                         f"hl.dsp.window.move({{ window = {a}, workspace = {lua_str(ws)}, follow = false }})",
                         ["movetoworkspacesilent", f"{ws},address:{addr}"],
                     )
+        if mode == "park" and park_as:
+            if parked:
+                write_json_atomic(park_path(park_as), parked)
+            else:
+                try:
+                    os.unlink(park_path(park_as))
+                except OSError:
+                    pass
+
+        # Return anything parked under this layout on a previous switch-away.
+        if unpark_name:
+            _unpark(unpark_name, hypr, used)
 
         target = layout.get("active_workspace")
         if target and not str(target).startswith("special:"):
@@ -1142,13 +1248,21 @@ def cmd_save(args):
     force = "--force" in args
     quiet = "--quiet" in args
     names = [a for a in args if not a.startswith("--")]
-    name = names[0] if names else get_active()
-    snap = save_layout(name, force=force, quiet=quiet)
-    if snap is None:
-        return 2
-    if "--no-activate" not in args:
-        set_active(name)
-    return 0
+    if names:
+        # An explicit named snapshot: freeze the current windows under <name>.
+        # This does NOT redirect the autosave daemon (named layouts stay frozen);
+        # it only records <name> as the last-applied layout for the bar tooltip.
+        name = names[0]
+        snap = save_layout(name, force=force, quiet=quiet)
+        if snap is None:
+            return 2
+        if "--no-activate" not in args:
+            set_active(name)
+        return 0
+    # Bare `save`: checkpoint the live session (what the shutdown/logout overrides
+    # call so the last desktop is captured before windows are torn down).
+    snap = save_session(force=force, quiet=quiet)
+    return 0 if snap is not None else 2
 
 
 def cmd_restore(args):
@@ -1187,11 +1301,13 @@ def cmd_switch(args):
         raise SystemExit(f"{APP}: no layout named '{name}' (save one first: omarchy-layout-swapper save {shlex.quote(name)})")
     if name == old:
         return cmd_restore([name])
-    # Preserve the layout we are leaving, then bring up the new one and park
-    # everything that is not part of it under special:ls-<old>.
-    save_layout(old, quiet=True)
+    # Frozen snapshots: NEVER rewrite the named layout we are leaving. Checkpoint
+    # the live session instead (so nothing open is lost), then bring up <name> and
+    # park everything that is not part of it under special:ls-<old>. Any windows
+    # parked under <name> on a previous switch-away are returned to their places.
+    save_session(quiet=True)
     set_active(name)
-    summary = reconcile(load_layout(name), mode="park", park_as=old)
+    summary = reconcile(load_layout(name), mode="park", park_as=old, unpark_name=name)
     msg = describe(summary, name)
     print(msg)
     notify(f"Switched to '{name}'", msg)
@@ -1239,7 +1355,15 @@ def cmd_delete(args):
         raise SystemExit("usage: omarchy-layout-swapper delete <name>")
     name = names[0]
     if name == get_active() and "--force" not in args:
-        raise SystemExit(f"{APP}: '{name}' is the active layout; switch first or use --force")
+        raise SystemExit(f"{APP}: '{name}' is the last-applied layout; switch away first or use --force")
+    # If windows are still parked under this layout, bring them back before the
+    # layout is gone — otherwise they are stranded on special:ls-<name> with no
+    # way to switch to it.
+    if os.path.exists(park_path(name)):
+        try:
+            _unpark(name, Hypr(), set())
+        except Exception as e:  # noqa: BLE001 - never let cleanup block a delete
+            log(f"could not un-park windows for '{name}': {e}")
     try:
         os.unlink(layout_path(name))
     except FileNotFoundError:
@@ -1260,6 +1384,13 @@ def cmd_rename(args):
     data["name"] = new
     write_json_atomic(layout_path(new), data)
     os.unlink(layout_path(old))
+    # Carry the park manifest along, so windows parked under <old> are still
+    # reclaimable after the rename.
+    if os.path.exists(park_path(old)):
+        try:
+            os.replace(park_path(old), park_path(new))
+        except OSError:
+            pass
     if get_active() == old:
         set_active(new)
     print(f"renamed '{old}' -> '{new}'")
@@ -1278,19 +1409,22 @@ def watch_pid():
 
 def cmd_status(args):
     cfg = load_config()
+    session = read_json(SESSION_FILE, {}) or {}
     info = {
         "active": get_active(),
         "watch_pid": watch_pid(),
         "boot": cfg["boot"],
         "layouts": list_layouts(),
         "restoring": lock_held(),
+        "session_windows": len(session.get("windows") or []),
     }
     if "--json" in args:
         print(json.dumps(info))
     elif "--short" in args:
         print(info["active"])
     else:
-        print(f"active layout : {info['active']}")
+        print(f"last layout   : {info['active']}")
+        print(f"live session  : {info['session_windows']} windows autosaved")
         print(f"watch daemon  : {'running (pid %d)' % info['watch_pid'] if info['watch_pid'] else 'not running'}")
         print(f"boot mode     : {info['boot']}")
         print(f"layouts       : {', '.join(info['layouts']) or '(none)'}")
@@ -1348,9 +1482,10 @@ def cmd_watch(args):
         nonlocal last_save, dirty
         if lock_held():
             return
-        name = get_active()
+        # Always write the live session — never a named snapshot. Named layouts
+        # are frozen and only change on an explicit save.
         try:
-            snap = save_layout(name, hypr=hypr, cfg=cfg, quiet=True)
+            snap = save_session(hypr=hypr, cfg=cfg, quiet=True)
         except SystemExit as e:
             log(str(e))
             snap = None
@@ -1358,7 +1493,7 @@ def cmd_watch(args):
         dirty = False
         if snap is not None:
             with open(LOG_FILE, "a", encoding="utf-8") as lf:
-                lf.write(f"{now_iso()} saved {name} ({len(snap['windows'])} windows, {reason})\n")
+                lf.write(f"{now_iso()} saved session ({len(snap['windows'])} windows, {reason})\n")
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(path)
@@ -1424,32 +1559,44 @@ def start_watch_detached():
         )
 
 
+def _restore_session(cfg):
+    """Bring back the live session; if there is none yet (first boot after an
+    upgrade, before the daemon's first save) fall back to the last-applied named
+    layout so login restore still works."""
+    data = read_json(SESSION_FILE)
+    if data and data.get("windows"):
+        summary = reconcile(data, mode="keep", cfg=cfg)
+        notify("Session restored", describe(summary, "your last session"))
+        return 0
+    name = get_active()
+    if os.path.exists(layout_path(name)):
+        summary = reconcile(load_layout(name), mode="keep", cfg=cfg)
+        notify("Layout restored", describe(summary, name))
+    return 0
+
+
 def cmd_boot(args):
     cfg = load_config()
     start_watch_detached()
     if "--no-wait" not in args and not FAKE_DIR:
         time.sleep(3)
-    layouts = list_layouts()
-    if not layouts:
-        return 0
     if cfg["boot"] == "ask":
-        rows = []
-        for n in layouts:
+        rows = ["\tLast session\tresume where you left off"]
+        for n in list_layouts():
             data = read_json(layout_path(n), {}) or {}
             rows.append(f"\t{n}\t{len(data.get('windows') or [])} windows")
         rows.append("\tSkip\tstart with an empty desktop")
         choice = menu_select("Restore layout", rows)
         if not choice or choice.startswith("Skip"):
             return 0
-        name = choice.split("\t", 1)[0]
-        set_active(name)
-    else:
-        name = get_active()
-        if name not in layouts:
-            return 0
-    summary = reconcile(load_layout(name), mode="keep", cfg=cfg)
-    notify("Layout restored", describe(summary, name))
-    return 0
+        label = choice.split("\t", 1)[0]
+        if label == "Last session":
+            return _restore_session(cfg)
+        set_active(label)
+        summary = reconcile(load_layout(label), mode="keep", cfg=cfg)
+        notify("Layout restored", describe(summary, label))
+        return 0
+    return _restore_session(cfg)
 
 
 # --------------------------------------------------------------------------
@@ -1482,9 +1629,9 @@ def cmd_menu(args):
         rows = []
         for n in list_layouts():
             data = read_json(layout_path(n), {}) or {}
-            note = f"{len(data.get('windows') or [])} windows" + ("  ·  active" if n == active else "")
+            note = f"{len(data.get('windows') or [])} windows" + ("  ·  current" if n == active else "")
             rows.append(f"{'󰄴' if n == active else '󰝦'}\t{n}\t{note}")
-        rows.append("\tNew layout…\tsave the current windows under a new name")
+        rows.append("\tNew layout…\tfreeze the current windows as a new snapshot")
         choice = menu_select("Switch layout", rows)
         if not choice:
             return 0
@@ -1499,14 +1646,30 @@ def cmd_menu(args):
         if not valid_name(name):
             notify("Invalid layout name", name)
             return 1
-        save_layout(name, quiet=True)
+        snap = save_layout(name, quiet=True)
+        if snap is None:
+            notify("Nothing to save", "No windows to snapshot right now.")
+            return 1
         set_active(name)
-        notify(f"Saved layout '{name}'", "It is now the active layout; autosave keeps it current.")
+        notify(f"Saved snapshot '{name}'", "A frozen snapshot — re-save it to capture new changes.")
+        return 0
+    if what == "save-now":
+        # Re-save the last-applied named snapshot in place (overwrites it; a backup
+        # is rotated). This is the only in-UI way to update a frozen snapshot.
+        name = active
+        if not os.path.exists(layout_path(name)):
+            notify("No snapshot to update", "Use “Save current as…” to create one first.")
+            return 1
+        snap = save_layout(name, quiet=True)
+        if snap is None:
+            notify("Nothing to save", "No windows to snapshot right now.")
+            return 1
+        notify(f"Updated snapshot '{name}'", f"Overwrote {name} ({len(snap['windows'])} windows); a backup was kept.")
         return 0
     if what == "delete":
         rows = [f"󰆴\t{n}" for n in list_layouts() if n != active]
         if not rows:
-            notify("Nothing to delete", "Only the active layout exists.")
+            notify("Nothing to delete", "Only the last-applied layout exists.")
             return 0
         choice = menu_select("Delete layout", rows)
         if not choice:
@@ -1525,7 +1688,7 @@ def cmd_menu(args):
         save_config(cfg)
         notify("Boot mode", f"Layout swapper will {'restore automatically' if cfg['boot'] == 'auto' else 'ask which layout to restore'} at login.")
         return 0
-    raise SystemExit("usage: omarchy-layout-swapper menu switch|save|delete|boot-mode")
+    raise SystemExit("usage: omarchy-layout-swapper menu switch|save|save-now|delete|boot-mode")
 
 
 def cmd_config(args):
@@ -1555,16 +1718,16 @@ def cmd_config(args):
 
 USAGE = """usage: omarchy-layout-swapper <command> [args]
 
-  save [name] [--force]            snapshot the current windows into <name> (default: active)
-  switch <name>                    save the active layout, park its windows, bring up <name>
-  restore [name] [--keep|--close]  reconcile <name> onto the current desktop (default: active)
+  save [name] [--force]            freeze a named snapshot; bare `save` checkpoints the live session
+  switch <name>                    checkpoint the session, park extras under special:ls-<old>, bring up <name>
+  restore [name] [--keep|--close]  reconcile <name> onto the current desktop (default: last-applied)
           [--from-backup [N]]      ... from the Nth most recent autosave backup
   list | show [name] [--json]      inspect layouts
   delete <name> | rename <a> <b>   manage layouts
-  watch [--replace]                autosave daemon (Hyprland IPC events, debounced)
-  boot                             start the daemon, then restore or ask (config: boot)
-  menu switch|save|delete|boot-mode   Omarchy menu pickers
-  status [--json|--short]          active layout, daemon, boot mode
+  watch [--replace]                autosave daemon writing the live session (Hyprland IPC, debounced)
+  boot                             start the daemon, then restore the session or ask (config: boot)
+  menu switch|save|save-now|delete|boot-mode   Omarchy menu pickers
+  status [--json|--short]          last layout, live session, daemon, boot mode
   config [key [value]]             show or set configuration
   update-notify on|off|toggle      opt in/out of login update checks (default off)
   update-check [--force] [--print] check the git remote for a newer version, notify what changed

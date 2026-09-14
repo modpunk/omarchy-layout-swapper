@@ -9,9 +9,9 @@
 #   2. keybinding SUPER + ALT + L -> layout switcher (~/.config/hypr/bindings.lua)
 #   3. "Layouts" submenu in the Omarchy menu (~/.config/omarchy/extensions/omarchy-menu.jsonc)
 #   4. save-before-shutdown overrides for the System menu entries (same file)
-#   5. post-boot hook that restores the last layout after login
+#   5. post-boot hook that restores your last session after login
 #   6. Chromium "Continue where you left off" in every profile (tabs come back)
-#   7. take the first snapshot and start the autosave daemon now
+#   7. checkpoint the live session and start the autosave daemon now
 set -euo pipefail
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$REPO/bin/omarchy-layout-swapper"
@@ -80,11 +80,11 @@ elif ask "Snapshot the layout right before Shutdown/Reboot/Logout from the Syste
   echo "  appended"
 fi
 
-# 5. Post-boot hook (restores the last layout after login)
+# 5. Post-boot hook (restores your last session after login)
 H="$HOME/.config/omarchy/hooks/post-boot.d/layout-swapper"
 if [[ -f $H ]] && grep -qF "BIN=\"$CMD\"" "$H"; then
   echo "  post-boot hook already installed at $H"
-elif ask "Install the post-boot hook so the last layout comes back after login ($H)?"; then
+elif ask "Install the post-boot hook so your last session comes back after login ($H)?"; then
   d=$(mktemp -d)
   sed "s|@BIN@|$CMD|" "$REPO/hooks/layout-swapper" >"$d/layout-swapper"
   omarchy-hook-install post-boot "$d/layout-swapper" >/dev/null
@@ -123,9 +123,9 @@ PY
   fi
 fi
 
-# 7. First snapshot + daemon
-if ask "Take the first snapshot of the current windows and start the autosave daemon now?"; then
-  "$BIN" save || true
+# 7. First session checkpoint + daemon
+if ask "Checkpoint your current windows into the live session and start the autosave daemon now?"; then
+  "$BIN" save || true   # bare save = live-session checkpoint (not a named snapshot)
   if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
     nohup setsid "$BIN" watch >/dev/null 2>&1 &
     sleep 0.5; "$BIN" status

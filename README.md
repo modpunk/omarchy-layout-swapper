@@ -2,24 +2,37 @@
 
 Save, switch, and auto-restore Hyprland window layouts.
 
-Hyprland has no session restore. Layout Swapper fills that gap on Omarchy:
-an autosave daemon keeps the **active layout** current, so after a power loss,
-a power cycle, or a reboot every app comes back on the workspace it was on.
-You can keep several **named layouts** and swap between them from the bar
-chip, the Omarchy menu, or `SUPER + ALT + L`. Switching preserves the layout
-you leave: its windows are *parked* on a hidden workspace rather than closed,
-so switching back is instant and nothing you had open is lost.
+Hyprland has no session restore. Layout Swapper fills that gap on Omarchy with
+two distinct things:
+
+- a **live session** that an autosave daemon keeps current as you work, so
+  after a power loss, a power cycle, or a reboot every app comes back on the
+  workspace it was on; and
+- any number of **named snapshots** — frozen, point-in-time layouts you save on
+  purpose and switch between from the bar chip, the Omarchy menu, or
+  `SUPER + ALT + L`.
+
+A named snapshot never changes on its own. Only an explicit save updates it, so
+a snapshot you named after today's setup still holds *today's* setup next month.
+The live session is the moving one; it is what boot restores. Switching to a
+snapshot preserves what you were doing: windows the snapshot does not mention
+are *parked* on a hidden workspace rather than closed, and switching back
+returns them exactly where they were.
 
 What comes back: the app, its workspace, monitor, floating geometry, pinned
 and fullscreen state. Web apps come back in the right Chromium profile,
 terminals in their working directory (with the program that was running in
-them), agent terminals (`org.omarchy.agent`) with their command and
-directory, tmux/herdr terminals re-attached. Regular browser windows come back
-with their tabs when Chromium's own *Continue where you left off* is on
+them), agent/Claude Code terminals (`org.omarchy.agent`) on their workspace
+with their command (a **fresh** agent — the window position is restored, not the
+conversation), tmux/herdr terminals re-attached. Regular browser windows come
+back with their tabs when Chromium's own *Continue where you left off* is on
 (`install.sh` offers to turn it on).
 
 What does not: window *contents* (unsaved text, scrollback). Only hibernate
-can do that.
+can do that. And windows you open *on top of* a snapshot survive switching away
+and back, but **not a reboot** — only the live session and explicit snapshots
+survive a power cycle. If you rearranged a snapshot and want the changes to
+stick, use **Save now** (below) to fold them in.
 
 ## Install
 
@@ -43,58 +56,64 @@ omarchy bar put fans.omarchy.layout-swapper
 
 ## Everyday use
 
-There is always one **active layout** (it starts as `main`). The autosave
-daemon keeps the active layout current for you as you open, move, and close
-windows, so you never have to save by hand. The bar chip's tooltip names the
-active layout.
+The autosave daemon keeps your **live session** current as you open, move, and
+close windows, so you never have to save it by hand — it is what comes back
+after a reboot. **Named snapshots** are separate and frozen: they change only
+when you save them. The bar chip's tooltip names the last snapshot you applied.
 
 Three ways in:
 
 | where | what it does |
 |---|---|
-| bar chip `󰕰` | **click** switch layout · **right-click** save the current windows as a new layout · **middle-click** set login behaviour |
-| `SUPER + ALT + L` | open the layout switcher |
+| bar chip `󰕰` | **click** switch snapshot · **right-click** freeze the current windows as a new snapshot · **middle-click** set login behaviour |
+| `SUPER + ALT + L` | open the switcher |
 | Omarchy menu → **Layouts** | switch, save as, save now, restore, login mode, delete, show |
 
-**Switching layouts.** Pick another layout from the switcher. The tool first
-saves where you are, then *parks* that layout's windows on a hidden workspace
-(they are not closed), and brings the chosen layout up. Switch back and your
-parked windows return exactly where they were, contents intact. So switching
-never loses anything you had open.
+**Switching snapshots.** Pick one from the switcher. The tool first checkpoints
+your live session, then *parks* the windows the chosen snapshot does not mention
+on a hidden workspace (they are not closed) and brings the snapshot up. Switch
+back and your parked windows return exactly where they were, contents intact. So
+switching never loses anything you had open.
 
-**Creating a layout.** The switcher's last row, **New layout…**, and
-right-clicking the bar chip both capture your current windows under a new
-name and make that the active layout. Your previous layout keeps its own
-autosaved copy, so nothing is lost. From there, rearrange and open apps as you
-like; autosave records it into the new layout.
+**Creating a snapshot.** The switcher's last row, **New layout…**, and
+right-clicking the bar chip both freeze your current windows under a new name.
+The snapshot is a fixed capture from that moment; it will not drift as you keep
+working. Rearrange freely — nothing is written back to it unless you ask.
 
-**At login.** By default the last active layout comes back automatically a few
+**Updating a snapshot.** Rearranged things and want the snapshot to match? Use
+**Save now** (Omarchy menu → Layouts, or `omarchy-layout-swapper save <name>`).
+It overwrites that snapshot in place and keeps a backup. This is the only thing
+that changes a named snapshot — nothing else does.
+
+**At login.** By default your last session comes back automatically a few
 seconds after you log in. Middle-click the bar chip (or the menu's *login
-mode*) to switch to being asked which layout to restore instead.
+mode*) to be asked instead — the picker offers **Last session** plus every named
+snapshot.
 
-**Recovering.** Every autosave keeps the last five snapshots per layout, so if
-a layout ends up wrong you can roll back:
+**Recovering.** The session and every snapshot keep their last five autosave
+backups, so if one ends up wrong you can roll back:
 
 ```
-omarchy-layout-swapper restore --from-backup        # most recent snapshot
-omarchy-layout-swapper restore <name> --from-backup 2   # the 2nd most recent
+omarchy-layout-swapper restore --from-backup            # most recent backup of the last snapshot
+omarchy-layout-swapper restore <name> --from-backup 2   # the 2nd most recent of <name>
 ```
 
 ### Command line
 
 ```
-omarchy-layout-swapper save [name]              snapshot now (default: active layout)
-omarchy-layout-swapper switch <name>            save current, park its windows, bring up <name>
+omarchy-layout-swapper save <name>              freeze/update the named snapshot <name>
+omarchy-layout-swapper save                     checkpoint the live session (no name)
+omarchy-layout-swapper switch <name>            checkpoint the session, park extras, bring up <name>
 omarchy-layout-swapper restore [name] [--close] reconcile onto the current desktop (keep or close extras)
 omarchy-layout-swapper restore --from-backup    from the most recent autosave backup (or N-th)
 omarchy-layout-swapper list | show | delete | rename
-omarchy-layout-swapper config boot auto|ask     restore automatically at login, or show the picker
+omarchy-layout-swapper config boot auto|ask     restore the session at login, or show the picker
 omarchy-layout-swapper status
 ```
 
-Layouts are plain JSON under `~/.config/omarchy-layout-swapper/layouts/`;
-autosave backups (last 5 per layout) under
-`~/.local/state/omarchy-layout-swapper/backups/`.
+Named snapshots are plain JSON under `~/.config/omarchy-layout-swapper/layouts/`.
+The live session (`session.json`), the park manifests (`parked/`), and autosave
+backups (last 5 each) live under `~/.local/state/omarchy-layout-swapper/`.
 
 ## Updating
 
@@ -136,9 +155,13 @@ are the changelog your users see.
 - **Save** reads `hyprctl clients -j` and derives a launch command per
   window: Omarchy web apps from their desktop files and `{ webapp = … }`
   bindings (class `chrome-<host>__-<Profile>` → `omarchy-launch-webapp <url>
-  --profile-directory=…`), PWAs from the class (`--app-id`), terminals from the
-  child shell's cwd and foreground job (`/proc`), native apps from their
-  command line and cwd. Transient shell windows and parked windows are skipped.
+  --profile-directory=…`), PWAs from the class (`--app-id`), terminals and
+  agent/Claude Code terminals from the child shell's cwd and foreground job
+  (`/proc`), native apps from their command line and cwd. Transient shell
+  windows and windows on special workspaces (scratchpad, parked) are skipped.
+  A named `save` freezes a snapshot under `layouts/`; a bare `save` (and the
+  autosave daemon) writes the live `session.json` — the two never touch each
+  other's files.
 - **Restore** is a reconcile: existing windows are claimed (by Hyprland's
   stable id, then class + title, then class) and moved into place; missing
   ones are launched one at a time with `hl.dsp.exec_cmd` and matched as they
@@ -147,14 +170,17 @@ are the changelog your users see.
   once per saved profile first so Chromium's own session restore can bring
   the tabs back. Legacy string dispatchers are used as a fallback on older
   Hyprland.
-- **Switch** saves the active layout, parks every window the target layout
-  does not mention on `special:ls-<old>`, and brings the target up. Switching
-  back reclaims the parked windows by id.
-- **Watch** listens on Hyprland's event socket, saves the active layout 5 s
+- **Switch** checkpoints the live session (it never rewrites the frozen snapshot
+  you are leaving), parks every window the target snapshot does not mention on
+  `special:ls-<old>` — recording each one's origin workspace and geometry in a
+  `parked/<old>.json` manifest — and brings the target up. Switching back
+  reclaims recorded members by id and un-parks everything the manifest lists, so
+  even windows the snapshot never mentioned come back where they were.
+- **Watch** listens on Hyprland's event socket, saves the **live session** 5 s
   after the last window event (and every 60 s), pauses while a restore runs,
   ignores a burst of window closes (that is a logout, not a layout), and
-  never saves on SIGTERM. A non-empty layout is never overwritten by an empty
-  snapshot.
+  never saves on SIGTERM. A non-empty session is never overwritten by an empty
+  snapshot. Named snapshots are frozen — the daemon never writes them.
 
 ## Development
 

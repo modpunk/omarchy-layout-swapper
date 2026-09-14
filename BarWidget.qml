@@ -5,9 +5,9 @@ import qs.Commons
 import qs.Ui
 
 // Bar chip for the Layout Swapper: a single icon whose tooltip names the
-// active layout. Everything that touches windows lives in
+// last-applied layout. Everything that touches windows lives in
 // bin/omarchy-layout-swapper; this widget only reads one small state file
-// (the active layout name, for the tooltip) and shells out fixed command
+// (the last-applied layout name, for the tooltip) and shells out fixed command
 // strings through bar.run (`bash -lc <command>`), so nothing parsed from
 // disk reaches the shell process as code.
 //
@@ -16,8 +16,8 @@ import qs.Ui
 // tooltip, not the label (a multi-word label overflows the slot and leaves
 // most of the chip unclickable).
 //
-//   left click    switch layout (picker; "New layout…" saves the current one)
-//   right click   save the current windows as a new layout
+//   left click    switch layout (picker; "New layout…" freezes a new snapshot)
+//   right click   freeze the current windows as a new snapshot
 //   middle click  choose what happens at login (restore automatically / ask)
 BarWidget {
   id: root
@@ -76,7 +76,7 @@ BarWidget {
     bar: root.bar
     text: "󰕰"                            // nf-md-view_dashboard
     slotSize: Style.bar.iconSlot
-    tooltipText: "Layout · " + root.activeName + "\nclick: switch · right: save new · middle: login mode"
+    tooltipText: "Last layout · " + root.activeName + "\nclick: switch · right: save new · middle: login mode"
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.run("menu save")
